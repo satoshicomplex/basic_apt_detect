@@ -1,0 +1,527 @@
+"""
+Blockchain Complex · ROCHESTER ACCIDENT PREVENTION APP  (v3, merged)
+================================================================================
+
+WHAT THIS DOES
+    The LAST-SECOND app: every earlier prevention has already failed, so an
+    accident is about to happen. An IoT raises a last-second emergency, approves
+    the waiver, sends its data and picks a pay option - all sub-second. Then, in
+    one call, this module:
+      1. takes the waiver + payment (a last-second emergency is FREE)
+      2. relays each would-be victim's coordinates to the most relevant IoTs in
+         range that can reach THAT victim
+      3. for each victim, works out the preventative MOVEMENT that avoids the
+         accident, and the signal that will cause it - to the exact SIDE(S) of
+         their senses - from sonic / kinetic / light / frequency, or all combined,
+         chosen from that victim's own data
+      4. broadcasts a distress signal, sub-second, from BOTH the requesting IoT
+         and this App, to the IoTs in proximity and the relevant IoTs in range,
+         carrying the precise situation and our recommendation
+      5. says whether signals from a MULTITUDE of IoTs will help, and what the
+         necessary signal is for each person in danger
+
+COORDINATE CONTRACT
+    Positions are in a local frame whose origin is the acting IoT. A victim may
+    carry `facing` (a unit vector); if absent we face them away from the hazard.
+    Zero-length / non-finite vectors are undefined and never drive a signal.
+
+SCOPE AND SAFETY
+    Every signal is a WARNING to the would-be victim to move - a startle or a
+    directional cue that prompts protective movement. This module never emits an
+    incapacitating or injurious signal, and it never targets anyone but the
+    people it is trying to save. Real deployment needs each IoT maker's
+    agreement, lawful use and review by counsel.
+
+PAYMENT  (company-wide)
+    data a peer shares         -> data units,           $BTC
+    neural networks a peer runs -> neural-network units, $BCH
+    A last-second emergency is FREE; a failed request is charged ZERO.
+
+STATUS
+    An EXAMPLE / REFERENCE framework, tested in simulation only. It shows one way
+    to orchestrate a last-second, multi-IoT accident-prevention response; the
+    geometry, reaction-time and signal models are deliberately simple stand-ins
+    for real sensor fusion. This is an open problem: the hope is that this and
+    OTHER apps work on it. Real deployment needs each IoT maker's agreement,
+    validated models, lawful use and review by counsel.
+
+PROVENANCE
+    Draft (Claude) -> review (Google) -> tightening (Grok) -> merged. Grok's input
+    validation with a fail-safe hand-off, the never-crash wrapper, the record of
+    which IoTs each victim's coordinates were relayed to, and the richer distress
+    recommendations.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("blockchain_complex.accident")
+
+# human reaction time by sense (seconds)
+REACTION_S = {"kinetic": 0.15, "frequency": 0.15, "sonic": 0.16, "light": 0.25}
+SPEED_OF_SOUND_MPS = 343.0
+MOVE_TIME_S = 0.35
+MULTITUDE_MARGIN_S = 0.6
+
+try:
+    import numpy as np
+
+    def _unit(v: Tuple[float, ...]) -> Optional[Tuple[float, ...]]:
+        if not v or len(v) < 2:
+            return None
+        a = np.asarray(v, dtype=float)
+        if not np.all(np.isfinite(a)):
+            return None
+        n = float(np.linalg.norm(a))
+        return tuple((a / n).tolist()) if n > 1e-9 else None
+
+    def _dot(a, b) -> float:
+        return float(np.dot(np.asarray(a, float), np.asarray(b, float)))
+
+    def _cross_z(a, b) -> float:
+        return float(a[0] * b[1] - a[1] * b[0])
+
+except ImportError:
+
+    def _unit(v: Tuple[float, ...]) -> Optional[Tuple[float, ...]]:
+        if not v or len(v) < 2 or not all(math.isfinite(x) for x in v):
+            return None
+        n = math.sqrt(sum(x * x for x in v))
+        return tuple(x / n for x in v) if n > 1e-9 else None
+
+    def _dot(a, b) -> float:
+        return sum(x * y for x, y in zip(a, b))
+
+    def _cross_z(a, b) -> float:
+        return a[0] * b[1] - a[1] * b[0]
+
+
+def _dist(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+# ===========================================================================
+# 1 · ADMISSION
+# ===========================================================================
+PLANS: Dict[str, Tuple[int, Tuple[str, ...]]] = {
+    "5": (2_000, ("USD", "BCH")),
+    "25": (12_500, ("USD", "BTC", "BCH", "top chain")),
+}
+
+
+@dataclass
+class Account:
+    iot_id: str
+    units: int = 0
+    plan: str = ""
+    charged_total: int = 0
+
+    def buy(self, plan: str, currency: str) -> None:
+        if plan not in PLANS:
+            raise ValueError(f"unknown plan '{plan}'")
+        units, accepted = PLANS[plan]
+        if currency not in accepted:
+            raise ValueError(f"${plan} plan is paid in {', '.join(accepted)}")
+        self.units += units
+        self.plan = plan
+
+    def settle(self, data_units_btc: int, nn_units_bch: int, succeeded: bool, is_emergency: bool) -> int:
+        if is_emergency or not succeeded:
+            return 0
+        used = min(max(0, data_units_btc) + max(0, nn_units_bch), self.units)
+        self.units -= used
+        self.charged_total += used
+        return used
+
+
+def admit(acct: Account, req: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+    if not req.get("waiver"):
+        logger.warning("admission declined: missing waiver iot=%s", acct.iot_id)
+        return None, "DECLINED: waiver not approved", False
+    if req.get("emergency"):
+        logger.info("admission free-emergency iot=%s", acct.iot_id)
+        return {"offer": "FREE", "terms": "last-second emergency: no charge; zero if we fail"}, "OK", True
+    if acct.units > 0:
+        logger.info("admission ok plan=%s units=%d iot=%s", acct.plan, acct.units, acct.iot_id)
+        return {"offer": f"plan ${acct.plan}", "units_left": acct.units}, "OK", True
+    return {"offer": "choose_plan", "options": ["$5 USD/BCH = 2,000 units",
+            "$25 USD/BTC/BCH/top chain = 12,500 units"]}, "NEEDS_PLAN", False
+
+
+# ===========================================================================
+# 2 · SCENE
+# ===========================================================================
+@dataclass
+class Hazard:
+    kind: str
+    where: Tuple[float, float, float]
+    seconds_to_impact: float
+    approach: Optional[Tuple[float, float, float]] = None
+    width_m: float = 2.0
+    threat_iot: Optional[str] = None
+    threat_can: List[str] = field(default_factory=list)
+
+
+@dataclass
+class Victim:
+    id: str
+    where: Tuple[float, float, float]
+    reachable: Dict[str, List[str]] = field(default_factory=dict)
+    biometrics: Dict[str, float] = field(default_factory=dict)
+    facing: Optional[Tuple[float, float, float]] = None
+
+
+@dataclass
+class DeployIoT:
+    name: str
+    where: Tuple[float, float, float]
+    can_emit: List[str]
+    range_m: float = 15.0
+    light_speed: bool = False
+
+
+# ===========================================================================
+# 3 · GEOMETRY
+# ===========================================================================
+def path_geometry(victim: Victim, hazard: Hazard) -> Dict[str, Any]:
+    rel = tuple(v - h for v, h in zip(victim.where, hazard.where))
+    appr = _unit(hazard.approach) if hazard.approach else None
+    if appr is None:
+        away = _unit(rel)
+        return {"in_line": True, "lateral_m": 0.0, "dodge": away}
+
+    along = _dot(rel, appr)
+    lateral_vec = tuple(r - along * a for r, a in zip(rel, appr))
+    lateral = math.sqrt(sum(x * x for x in lateral_vec))
+
+    perp = _unit((-appr[1], appr[0], 0.0)) or _unit((1.0, 0.0, 0.0))
+    dodge = _unit(lateral_vec) or perp
+    half_width = max(0.0, hazard.width_m) / 2.0
+    in_line = along >= 0.0 and lateral <= half_width
+    return {"in_line": in_line, "lateral_m": round(lateral, 2), "dodge": dodge}
+
+
+def escape_vector(victim: Victim, hazard: Hazard) -> Optional[Tuple[float, float, float]]:
+    return path_geometry(victim, hazard)["dodge"]
+
+
+def side_of(victim: Victim, direction: Optional[Tuple[float, float, float]], hazard: Hazard) -> str:
+    if direction is None:
+        return "any"
+    d = _unit(direction)
+    facing = _unit(victim.facing) if victim.facing else escape_vector(victim, hazard)
+    if d is None or facing is None:
+        return "any"
+    fb = _dot(facing, d)
+    lr = _cross_z(facing, d)
+    if abs(fb) >= abs(lr):
+        return "front" if fb > 0 else "back"
+    return "left" if lr > 0 else "right"
+
+
+# ===========================================================================
+# 4 · SIGNAL SELECTION
+# ===========================================================================
+def _travel_delay_s(io: DeployIoT, victim: Victim, modality: str) -> float:
+    if io.light_speed or modality in ("light", "frequency"):
+        return 0.0
+    if modality == "sonic":
+        return _dist(io.where, victim.where) / SPEED_OF_SOUND_MPS
+    return 0.0
+
+
+def _reach(io: DeployIoT, victim: Victim) -> bool:
+    if _unit(io.where) is None and _unit(victim.where) is None:
+        return True
+    return _dist(victim.where, io.where) <= max(0.0, io.range_m)
+
+
+def _victim_reaction_s(victim: Victim, modality: str) -> float:
+    custom_key = f"reaction_{modality}_s"
+    if custom_key in victim.biometrics and math.isfinite(victim.biometrics[custom_key]):
+        return max(0.05, float(victim.biometrics[custom_key]))
+    base = REACTION_S.get(modality, 0.3)
+    hr = victim.biometrics.get("hr", 80.0)
+    stress_penalty = 0.03 if (math.isfinite(hr) and hr > 130.0) else 0.0
+    return base + stress_penalty
+
+
+def _side_compatible(reachable_sides: List[str], target_side: str) -> bool:
+    if not reachable_sides:
+        return False
+    omni_or_worn = {"any", "wrist", "torso", "all"}
+    return bool(omni_or_worn.intersection(reachable_sides)) or target_side in reachable_sides
+
+
+def _available(victim: Victim, deploy_iots: List[DeployIoT],
+               safe_side: str, hazard_side: str) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for m, sides in victim.reachable.items():
+        if not sides:
+            continue
+        in_range_iots = [io for io in deploy_iots if m in io.can_emit and (io.light_speed or _reach(io, victim))]
+        if not in_range_iots:
+            continue
+        min_transit = min(_travel_delay_s(io, victim, m) for io in in_range_iots)
+        total_latency = _victim_reaction_s(victim, m) + min_transit
+        can_go = _side_compatible(sides, safe_side)
+        can_startle = _side_compatible(sides, hazard_side)
+        out[m] = {
+            "sides": sides,
+            "iots": in_range_iots,
+            "latency_s": round(total_latency, 3),
+            "can_go": can_go,
+            "can_startle": can_startle,
+            "directional_match": can_go or can_startle,
+        }
+    return out
+
+
+def choose_signal(victim: Victim, hazard: Hazard, deploy_iots: List[DeployIoT]) -> Dict[str, Any]:
+    escape = escape_vector(victim, hazard)
+    hazard_dir = _unit(tuple(h - v for h, v in zip(hazard.where, victim.where)))
+    safe_side = side_of(victim, escape, hazard)
+    hazard_side = side_of(victim, hazard_dir, hazard)
+    avail = _available(victim, deploy_iots, safe_side, hazard_side)
+
+    t = max(0.0, float(hazard.seconds_to_impact)) if math.isfinite(hazard.seconds_to_impact) else 0.0
+    ranked = sorted(avail.keys(), key=lambda m: (not avail[m]["directional_match"], avail[m]["latency_s"]))
+
+    budget = t - MOVE_TIME_S
+    pick: List[str] = []
+    for m in ranked:
+        if avail[m]["latency_s"] <= budget or not pick:
+            pick.append(m)
+        if budget - max((avail[p]["latency_s"] for p in pick), default=0.0) > MULTITUDE_MARGIN_S and len(pick) >= 2:
+            break
+
+    combined = len(pick) >= 2
+    geo = path_geometry(victim, hazard)
+    movement = _describe_move(escape, safe_side, geo["in_line"])
+
+    cues = []
+    for m in pick:
+        info = avail[m]
+        go_side = safe_side if info["can_go"] else (info["sides"][0] if info["sides"] else "any")
+        startle = hazard_side if info["can_startle"] else None
+        cues.append({
+            "modality": m,
+            "go_cue_side": go_side,
+            "startle_side": startle,
+            "directional_match": info["directional_match"],
+            "est_response_s": info["latency_s"],
+        })
+
+    fastest_latency = min((avail[p]["latency_s"] for p in pick), default=999.0)
+    reachable_in_time = bool(pick) and (fastest_latency + MOVE_TIME_S) <= t
+
+    if not pick:
+        logger.info("no reachable modality for victim=%s", victim.id)
+
+    return {
+        "victim": victim.id,
+        "in_line_with_threat": geo["in_line"],
+        "lateral_m": geo["lateral_m"],
+        "movement": movement,
+        "escape_vector": escape,
+        "safe_side": safe_side,
+        "hazard_side": hazard_side,
+        "modalities": pick,
+        "combined": combined,
+        "cues": cues,
+        "reachable_in_time": reachable_in_time,
+        "seconds_to_impact": t,
+        "coordinates_relayed_to": [io.name for m in pick for io in avail.get(m, {}).get("iots", [])],
+    }
+
+
+def _describe_move(escape: Optional[Tuple[float, float, float]], safe_side: str, in_line: bool) -> str:
+    if escape is None:
+        return "move clear of the hazard"
+    verbs = {"front": "move forward", "back": "step back", "left": "move left", "right": "move right",
+             "any": "move clear"}
+    base = verbs.get(safe_side, "move clear")
+    return f"DODGE: {base} off the path" if in_line else f"{base} to stay clear"
+
+
+def assist_threat(hazard: Hazard, victims_in_line: List[str]) -> Optional[Dict[str, Any]]:
+    if not hazard.threat_iot:
+        return None
+    priority = ["brake", "stop", "slow", "swerve"]
+    asks = [a for a in priority if a in hazard.threat_can] or ["slow or stop if you can"]
+    logger.info("threat-side assist requested to=%s victims=%s", hazard.threat_iot, victims_in_line)
+    return {
+        "to": hazard.threat_iot,
+        "situation": f"you are on course to hit {len(victims_in_line)} person(s) in "
+                     f"{max(0.0, hazard.seconds_to_impact):.1f}s: {', '.join(victims_in_line)}",
+        "requested_assistance": asks,
+        "note": "assist from the threat side; the people are being warned to dodge at the same time",
+    }
+
+
+# ===========================================================================
+# 5 · ASSIGN + MULTITUDE
+# ===========================================================================
+def assign_iots(victim: Victim, signal: Dict[str, Any], deploy_iots: List[DeployIoT]) -> Dict[str, Any]:
+    assigned = []
+    for m in signal["modalities"]:
+        for io in deploy_iots:
+            if m in io.can_emit and (io.light_speed or _reach(io, victim)):
+                assigned.append({
+                    "iot": io.name,
+                    "modality": m,
+                    "via": "light speed (frequency)" if io.light_speed and m == "frequency" else "in range",
+                })
+
+    fastest = min((c["est_response_s"] for c in signal["cues"]), default=0.3)
+    slack = signal["seconds_to_impact"] - (MOVE_TIME_S + fastest)
+    unmatched_side = any(not c["directional_match"] for c in signal["cues"])
+
+    multitude_helps = (
+        (not signal["reachable_in_time"])
+        or slack < MULTITUDE_MARGIN_S
+        or signal["combined"]
+        or unmatched_side
+    )
+    why = (
+        "time is very short or side coverage is partial: more IoTs from more sides make the warning impossible to miss"
+        if multitude_helps else "one clear signal is enough"
+    )
+    logger.info("assign victim=%s multitude=%s reason=%s", victim.id, multitude_helps, why)
+    return {"assigned_iots": assigned, "multitude_helps": multitude_helps, "why": why}
+
+
+# ===========================================================================
+# 6 · DISTRESS
+# ===========================================================================
+def distress(requesting_iot: str, hazard: Hazard, per_victim: List[Dict[str, Any]],
+             proximity_iots: List[str], relevant_iots: List[str],
+             threat_assist: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    recs = [{
+        "victim": p["signal"]["victim"],
+        "coordinates": p["coordinates"],
+        "relayed_to": p["signal"].get("coordinates_relayed_to", []),
+        "needed_signal": p["signal"]["modalities"],
+        "cues": p["signal"]["cues"],
+        "sides": {"go": p["signal"]["safe_side"], "startle": p["signal"]["hazard_side"]},
+        "movement": p["signal"]["movement"],
+        "multitude_helps": p["assignment"]["multitude_helps"],
+    } for p in per_victim]
+
+    body = {
+        "from": [requesting_iot, "satoshi complex / Rochester Accident Prevention"],
+        "hazard": {"kind": hazard.kind, "seconds_to_impact": max(0.0, hazard.seconds_to_impact)},
+        "victims_in_danger": len(per_victim),
+        "recommendations": recs,
+        "threat_side": threat_assist,
+    }
+    return {"to_proximity": proximity_iots, "to_relevant": relevant_iots, "message": body}
+
+
+# ===========================================================================
+# 7 · VALIDATION + ORCHESTRATOR
+# ===========================================================================
+def _validate(hazard: Hazard, victims: List[Victim], deploy_iots: List[DeployIoT]) -> Optional[str]:
+    if not math.isfinite(hazard.seconds_to_impact) or hazard.seconds_to_impact <= 0:
+        return "invalid or expired seconds_to_impact"
+    for v in victims:
+        if not all(math.isfinite(x) for x in v.where):
+            return f"non-finite coordinate on victim {v.id}"
+    if not all(math.isfinite(x) for x in hazard.where):
+        return "non-finite hazard coordinate"
+    for io in deploy_iots:
+        if not all(math.isfinite(x) for x in io.where):
+            return f"non-finite coordinate on IoT {io.name}"
+    return None
+
+
+def respond(acct: Account, req: Dict[str, Any], hazard: Hazard, victims: List[Victim],
+            deploy_iots: List[DeployIoT]) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    ms = lambda: round((time.perf_counter() - t0) * 1000, 2)
+    is_emergency = bool(req.get("emergency", False))
+
+    err = _validate(hazard, victims, deploy_iots)
+    if err:
+        logger.error("validation failed iot=%s: %s", acct.iot_id, err)
+        return {"status": "HANDOFF", "reason": err, "billed_units": 0, "latency_ms": ms()}
+
+    receipt, status, authorized = admit(acct, req)
+    if not authorized:
+        return {"status": status, "receipt": receipt, "latency_ms": ms()}
+    if not victims:
+        return {"status": "NO_VICTIM", "latency_ms": ms()}
+
+    try:
+        per_victim = []
+        any_reachable = False
+        active_relevant_iots = list(dict.fromkeys(req.get("relevant_iots", [])))
+
+        for v in victims:
+            sig = choose_signal(v, hazard, deploy_iots)
+            asg = assign_iots(v, sig, deploy_iots)
+            any_reachable = any_reachable or sig["reachable_in_time"]
+            for item in asg["assigned_iots"]:
+                if item["iot"] not in active_relevant_iots:
+                    active_relevant_iots.append(item["iot"])
+            per_victim.append({"coordinates": v.where, "signal": sig, "assignment": asg})
+
+        in_line = [p["signal"]["victim"] for p in per_victim if p["signal"]["in_line_with_threat"]]
+        threat_assist = assist_threat(hazard, in_line) if in_line else None
+
+        cast = distress(acct.iot_id, hazard, per_victim,
+                        req.get("proximity_iots", []), active_relevant_iots, threat_assist)
+
+        succeeded = any_reachable or threat_assist is not None
+        billed = acct.settle(len(victims) + len(deploy_iots), 2 * len(victims), succeeded, is_emergency)
+
+        logger.info("respond complete iot=%s victims=%d in_line=%d reachable=%s billed=%d %.1fms",
+                    acct.iot_id, len(victims), len(in_line), any_reachable, billed, ms())
+
+        return {
+            "status": "OK" if any_reachable else "ACTED_BUT_TIGHT",
+            "receipt": receipt,
+            "hazard": {"kind": hazard.kind, "seconds_to_impact": hazard.seconds_to_impact},
+            "per_victim": per_victim,
+            "threat_assist": threat_assist,
+            "distress": cast,
+            "all_reachable_in_time": all(p["signal"]["reachable_in_time"] for p in per_victim),
+            "billed_units": billed,
+            "latency_ms": ms(),
+        }
+    except Exception as exc:
+        logger.exception("execution fallback iot=%s", acct.iot_id)
+        return {"status": "HANDOFF", "reason": f"{type(exc).__name__}: {exc}",
+                "billed_units": 0, "latency_ms": ms()}
+
+
+# ===========================================================================
+# 8 · SELF-TEST / DEMO
+# ===========================================================================
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    acct = Account("crossing-cam-7")
+
+    hazard = Hazard(kind="vehicle", where=(10.0, 0.0, 0.0), seconds_to_impact=1.2, approach=(-1.0, 0.0, 0.0),
+                    width_m=2.5, threat_iot="sedan-Rx-88", threat_can=["brake", "swerve", "slow"])
+    victims = [
+        Victim("pedestrian_1", (0.0, 0.0, 0.0),
+               reachable={"sonic": ["left", "right"], "light": ["front"], "kinetic": ["wrist"]},
+               biometrics={"hr": 90}),
+        Victim("cyclist_2", (2.0, 1.0, 0.0),
+               reachable={"frequency": ["any"], "sonic": ["right"]}, facing=(1.0, 0.0, 0.0)),
+    ]
+    iots = [
+        DeployIoT("crosswalk speaker", (0.5, 0.0, 0.0), ["sonic", "light"], range_m=20),
+        DeployIoT("victim_1 smartwatch", (0.0, 0.0, 0.0), ["kinetic"], range_m=2),
+        DeployIoT("city RF beacon", (400.0, 0.0, 0.0), ["frequency"], range_m=1, light_speed=True),
+    ]
+    req = {"waiver": True, "emergency": True, "proximity_iots": ["traffic light 4"],
+           "relevant_iots": ["bus-stop sign", "streetlamp-12"]}
+    out = respond(acct, req, hazard, victims, iots)
+    print(json.dumps(out, indent=2, default=str))
