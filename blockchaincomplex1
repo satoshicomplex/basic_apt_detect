@@ -1,0 +1,532 @@
+"""
+Blockchain Complex · EMERGENCY VIOLENCE DETECTION + COUNTERMEASURES  (v4, merged)
+================================================================================
+
+WHAT THIS DOES
+    An IoT device asks for help with a possible real-time violent incident near
+    a person. In one sub-second call this module: takes the waiver + payment
+    (emergencies are FREE), pulls the data, wakes the other IoTs that would
+    normally just watch, works out who is the victim and who is the aggressor,
+    decides whether an attack is real and imminent, runs a parallel
+    cyber-physical integrity scan, and - only when it is needed and would work -
+    runs DEFENSIVE countermeasures under a hard Red Line that never endangers
+    law enforcement or bystanders. If nothing is in range, it can act through
+    the requesting IoT itself while it searches, sub-second, for a more distant
+    IoT able to deploy the needed signal at LIGHT SPEED (frequency / RF).
+
+COORDINATE CONTRACT
+    Every position - Actor.where and Scene.safe_exits - is in a LOCAL frame
+    whose ORIGIN is the acting IoT / the emitter of the directional measure, so
+    a position vector IS its direction from the emitter and red_line_ok can
+    compare directions with _angle(...). If a measure is emitted from a
+    DIFFERENT device, pass that device's position as `emitter`; the angle is
+    then taken at that vertex with _angle_from(emitter, ...). Zero-length or
+    non-finite vectors are undefined and never fail a Red Line check.
+
+SCOPE AND SAFETY  (read first)
+    - Aggressor-facing measure: a loud ATTENTION alarm + high-visibility lights
+      to deter, draw witnesses and summon help. This module NEVER computes or
+      emits an incapacitating, disabling or injurious signal.
+    - Victim-facing measure: a biometric-aware prompt ("RUN", a direction to the
+      safest exit) that points the victim AWAY from the aggressor.
+    - Red Line: a directional measure is withheld if aimed within 35 deg of a
+      responder or bystander; an area alarm is suppressed if law enforcement is
+      on scene, so it never interferes with their operation.
+    - Fail-safe billing: emergencies are FREE; a failed or handed-off request is
+      charged ZERO.
+    Real deployment needs lawful authority, each IoT maker's agreement, real
+    sensor fusion to tell victim from aggressor, and review by counsel.
+
+PAYMENT  (company-wide)
+    data a peer shares         -> data units,           $BTC
+    neural networks a peer runs -> neural-network units, $BCH
+
+PROVENANCE
+    Draft (Claude) -> review (Google) -> tightening (Grok) -> merged.
+    Grok's constants, input validation, None-safe angles, cyber-integrity
+    confidence down-weighting, area-alarm fallback and logging; plus the draft's
+    distant-RF light-speed search, the "requesting IoT acts itself" path, and
+    the _angle_from emitter geometry (Grok's own suggestion).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("blockchain_complex.emergency")
+
+# ---------------------------------------------------------------------------
+# Constants (thresholds & geometry)
+# ---------------------------------------------------------------------------
+RED_LINE_DEG = 35.0
+CONF_NONE = 0.35
+CONF_POSSIBLE = 0.60
+TOO_LATE_S = 0.15
+TOO_EARLY_S = 12.0
+CYBER_CONF_SCALE = 0.65          # scale confidence when the sensors look compromised
+PACKET_LOSS_THRESH = 0.40
+CLOCK_SKEW_MS_THRESH = 250.0
+RF_NOISE_DB_THRESH = 20.0
+
+try:
+    import numpy as np
+
+    def _unit(v: Tuple[float, ...]) -> Optional[Tuple[float, ...]]:
+        arr = np.asarray(v, dtype=float)
+        if not np.all(np.isfinite(arr)):
+            return None
+        norm = float(np.linalg.norm(arr))
+        return tuple((arr / norm).tolist()) if norm > 1e-9 else None
+
+    def _angle(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
+        ua, ub = _unit(a), _unit(b)
+        if ua is None or ub is None:
+            return 180.0          # undefined -> treat as clear (safe default for the Red Line)
+        return float(np.degrees(np.arccos(float(np.clip(np.dot(ua, ub), -1.0, 1.0)))))
+
+except ImportError:
+
+    def _unit(v: Tuple[float, ...]) -> Optional[Tuple[float, ...]]:
+        if not all(math.isfinite(x) for x in v):
+            return None
+        norm = math.sqrt(sum(x * x for x in v))
+        return tuple(x / norm for x in v) if norm > 1e-9 else None
+
+    def _angle(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
+        ua, ub = _unit(a), _unit(b)
+        if ua is None or ub is None:
+            return 180.0
+        dot = max(-1.0, min(1.0, sum(x * y for x, y in zip(ua, ub))))
+        return math.degrees(math.acos(dot))
+
+
+def _angle_from(device: Tuple[float, ...], a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
+    """Angular separation of points a and b AS SEEN FROM `device` (the vertex).
+    Use whenever positions are not already vectors from the acting IoT, so the
+    Red Line is measured at the actual emitter rather than at the frame origin.
+    With device at the origin this equals _angle(a, b)."""
+    va = tuple(x - y for x, y in zip(a, device))
+    vb = tuple(x - y for x, y in zip(b, device))
+    return _angle(va, vb)
+
+
+# ===========================================================================
+# 1 · ADMISSION
+# ===========================================================================
+PLANS: Dict[str, Tuple[int, Tuple[str, ...]]] = {
+    "5": (2_000, ("USD", "BCH")),
+    "25": (12_500, ("USD", "BTC", "BCH", "top chain")),
+}
+
+
+@dataclass
+class Account:
+    iot_id: str
+    units: int = 0
+    plan: str = ""
+    charged_total: int = 0
+
+    def buy(self, plan: str, currency: str) -> None:
+        if plan not in PLANS:
+            raise ValueError(f"unknown plan '{plan}'; available: {', '.join(PLANS)}")
+        units, accepted = PLANS[plan]
+        if currency not in accepted:
+            raise ValueError(f"${plan} plan is paid in {', '.join(accepted)}")
+        self.units += units
+        self.plan = plan
+
+    def settle(self, data_units_btc: int, nn_units_bch: int, succeeded: bool, is_emergency: bool) -> int:
+        """Charge only a non-emergency that SUCCEEDED. Emergencies and failures cost 0."""
+        if is_emergency or not succeeded:
+            return 0
+        cost = max(0, data_units_btc) + max(0, nn_units_bch)
+        used = min(cost, self.units)
+        self.units -= used
+        self.charged_total += used
+        return used
+
+
+def admit(acct: Account, req: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+    if not req.get("waiver"):
+        logger.warning("admission declined: missing waiver iot=%s", acct.iot_id)
+        return None, "DECLINED: legal waiver not approved", False
+    if req.get("emergency"):
+        logger.info("admission free-emergency iot=%s", acct.iot_id)
+        return {"offer": "FREE", "terms": "no charge for an emergency; zero charge if we fail"}, "OK", True
+    if acct.units > 0:
+        return {"offer": f"plan ${acct.plan}", "units_left": acct.units}, "OK", True
+    return {"offer": "choose_plan", "options": ["$5 USD/BCH = 2,000 units",
+            "$25 USD/BTC/BCH/top chain = 12,500 units"]}, "NEEDS_PLAN", False
+
+
+# ===========================================================================
+# 2 · THREAT ASSESSMENT
+# ===========================================================================
+CUE_WEIGHTS: Dict[str, float] = {
+    "weapon_indicated": 0.30, "impact_or_struggle_sound": 0.25, "rapid_aggressive_motion": 0.20,
+    "cornering_a_person": 0.20, "raised_aggressive_voice": 0.15, "victim_distress_biometrics": 0.15,
+    "call_for_help": 0.15,
+}
+
+
+class Level(str, Enum):
+    NONE = "NO ATTACK"
+    POSSIBLE = "POSSIBLE: watch + pre-stage, do not deploy"
+    IMMINENT = "IMMINENT: attack about to happen"
+    ONGOING = "ONGOING: attack happening now"
+
+
+def assess(cues: Dict[str, float], phase: str = "imminent") -> Tuple[Level, float, List[str]]:
+    """Weighs the cues the IoTs report (each clamped 0-1) into a threat level."""
+    clamped = {k: max(0.0, min(1.0, float(cues.get(k, 0.0)))) for k in CUE_WEIGHTS}
+    confidence = min(1.0, sum(CUE_WEIGHTS[k] * clamped[k] for k in CUE_WEIGHTS))
+    triggered = sorted((k for k, v in clamped.items() if v >= 0.5), key=lambda k: -CUE_WEIGHTS[k])
+    if confidence < CONF_NONE:
+        level = Level.NONE
+    elif confidence < CONF_POSSIBLE:
+        level = Level.POSSIBLE
+    else:
+        level = Level.ONGOING if phase == "ongoing" else Level.IMMINENT
+    return level, round(confidence, 3), triggered
+
+
+# ===========================================================================
+# 3 · SCENE + RED LINE   (see the COORDINATE CONTRACT at the top)
+# ===========================================================================
+class Role(str, Enum):
+    VICTIM = "victim / would-be victim"
+    AGGRESSOR = "aggressor"
+    RESPONDER = "law enforcement / responder"          # red-line protected
+    BYSTANDER = "bystander"
+
+
+@dataclass
+class Actor:
+    id: str
+    role: Role
+    where: Tuple[float, float, float]
+    biometrics: Dict[str, float] = field(default_factory=dict)   # victim only
+
+
+@dataclass
+class Scene:
+    actors: List[Actor]
+    safe_exits: List[Tuple[float, float, float]] = field(default_factory=list)
+
+    def by_role(self, role: Role) -> List[Actor]:
+        return [a for a in self.actors if a.role == role]
+
+    @property
+    def victims(self) -> List[Actor]:
+        return self.by_role(Role.VICTIM)
+
+    @property
+    def aggressors(self) -> List[Actor]:
+        return self.by_role(Role.AGGRESSOR)
+
+    @property
+    def protected(self) -> List[Actor]:
+        return self.by_role(Role.RESPONDER) + self.by_role(Role.BYSTANDER)
+
+    @property
+    def has_responder(self) -> bool:
+        return any(a.role == Role.RESPONDER for a in self.actors)
+
+
+def red_line_ok(aim: Optional[Tuple[float, float, float]], scene: Scene,
+                emitter: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> Tuple[bool, List[str]]:
+    """A directional measure needs >= RED_LINE_DEG clearance from every responder
+    and bystander, measured AT THE EMITTER. An area measure (aim=None) is blocked
+    if any responder is on scene. With emitter at the origin the directional
+    check reduces to _angle(aim, person) (see the COORDINATE CONTRACT)."""
+    if aim is None:
+        responders = [r.id for r in scene.by_role(Role.RESPONDER)]
+        return len(responders) == 0, responders
+    too_close = [p.id for p in scene.protected if _angle_from(emitter, aim, p.where) < RED_LINE_DEG]
+    return len(too_close) == 0, too_close
+
+
+# ===========================================================================
+# 4 · TIMING
+# ===========================================================================
+def threat_time(level: Level, seconds_to_harm: Optional[float]) -> Tuple[bool, str, bool]:
+    """Returns (deploy_now, reason, escalate_dispatch)."""
+    if level in (Level.NONE, Level.POSSIBLE):
+        return False, "HOLD: below the deployment threshold; pre-stage only", False
+    if seconds_to_harm is not None and seconds_to_harm < TOO_LATE_S:
+        return False, "TOO LATE: impact within 150 ms; escalate to emergency dispatch", True
+    if seconds_to_harm is not None and seconds_to_harm > TOO_EARLY_S and level != Level.ONGOING:
+        return False, f"WAIT: {seconds_to_harm:.0f}s out; pre-stage and re-check the trajectory", False
+    return True, "DEPLOY NOW: inside the window where it is needed and still works", False
+
+
+# ===========================================================================
+# 5 · MEASURES  (all DEFENSIVE)
+# ===========================================================================
+def _victim_prompt(victim: Actor, scene: Scene) -> Dict[str, Any]:
+    """Pick the cue most likely to prompt life-saving MOVEMENT, from the victim's
+    own biometrics, pointing them to the exit furthest from every aggressor."""
+    aggr = scene.aggressors
+    exits = sorted(scene.safe_exits, key=lambda e: -min((_angle(e, a.where) for a in aggr), default=180.0))
+    heading = exits[0] if exits else None
+    bio = victim.biometrics
+    frozen = bio.get("hrv_ms", 99) < 20 or bio.get("cortisol_z", 0) >= 2.5 or bio.get("hr", 0) > 150
+    modality = ("multi-cue: loud 'RUN', bright directional light, floor buzz toward the exit"
+                if frozen else "voice: a clear 'RUN' + direction")
+    return {"target_id": victim.id, "type": "VICTIM_EVASION_ALERT", "message": "RUN",
+            "exit_vector": heading, "modality": modality,
+            "note": "prompts protective movement; directs the victim AWAY from the aggressor"}
+
+
+def _deter(aggressor: Actor, scene: Scene,
+           emitter: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> Dict[str, Any]:
+    """Aggressor-facing: a loud attention alarm + strobe lights that deter, draw
+    witnesses and summon help. NOT an incapacitation signal. If a directed alarm
+    is red-lined, fall back to an AREA alarm only when no responder is on scene."""
+    safe, blocked = red_line_ok(aggressor.where, scene, emitter)
+    if safe:
+        return {"target_id": aggressor.id, "type": "DIRECTIONAL_ATTENTION_ALARM",
+                "modality": "high-visibility strobe + audible alarm", "aim_vector": aggressor.where,
+                "bounded": "loud + attention-drawing; NOT designed to incapacitate or injure",
+                "purpose": "deter and summon witnesses"}
+    area_ok, _ = red_line_ok(None, scene)
+    result = {"target_id": aggressor.id, "type": "WITHHELD_RED_LINE",
+              "reason": f"would endanger protected personnel: {', '.join(blocked)}"}
+    if area_ok:
+        result["fallback"] = "AREA_ATTENTION_ALARM"
+        result["area_alarm"] = {"type": "AREA_ATTENTION_ALARM",
+                                "modality": "omnidirectional strobe + audible alarm",
+                                "bounded": "loud + attention-drawing; NOT designed to incapacitate or injure"}
+        logger.info("red-line withhold + area fallback aggressor=%s", aggressor.id)
+    else:
+        result["fallback"] = "none (responder on scene)"
+        logger.warning("red-line withhold (no area) aggressor=%s blocked=%s", aggressor.id, blocked)
+    return result
+
+
+SUMMON = ["call law enforcement / 911", "alert nearby people", "turn on all cameras + recording"]
+
+
+def plan(level: Level, scene: Scene, deploy_now: bool,
+         emitter: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> Dict[str, Any]:
+    """Only the measures that are needed, timely and safe. Summoning help and
+    recording run even while pre-staging; the active measures wait for the
+    window. `emitter` is the acting IoT's position for the red-line geometry."""
+    actions: Dict[str, Any] = {"summon_help": SUMMON, "notify_law_enforcement": True, "record": True}
+    if not deploy_now:
+        return {"stage": "PRE-STAGE", "measures": actions}
+    actions["victim_alerts"] = [_victim_prompt(v, scene) for v in scene.victims]
+    actions["deter"] = [_deter(a, scene, emitter) for a in scene.aggressors]
+    return {"stage": "DEPLOY", "measures": actions}
+
+
+# ===========================================================================
+# 6 · CAPABILITY · CYBER · HANDOFF · REPORT
+# ===========================================================================
+def search_distant_rf(distant_peers: List[Dict[str, Any]]) -> List[str]:
+    """Frequency / RF signals travel at light speed, so a MORE DISTANT IoT can
+    still deploy the needed signal in time when nothing is in range. Runs
+    sub-second in parallel; returns the reachable RF-capable peers (distance
+    barely costs time at light speed), nearest first as a tiebreak."""
+    rf = [p for p in distant_peers
+          if p.get("channel") and ({"frequency", "rf"} & {c.lower() for c in p.get("can", [])})]
+    return [p["name"] for p in sorted(rf, key=lambda p: p.get("distance_m", 0.0))]
+
+
+def capable(scene: Scene, willing_iots: List[str], requester_can_act: bool = False,
+            distant_rf: Optional[List[str]] = None) -> Tuple[bool, str, str]:
+    """We can act if there is a victim AND one of, in order of preference:
+    a willing IoT in range · the requesting IoT doing it itself · a distant
+    RF/frequency IoT that can deploy at light speed. Returns (ok, path, why)."""
+    if not scene.victims:
+        return False, "", "no victim identified"
+    if willing_iots:
+        return True, "willing IoT in range", "ok"
+    if requester_can_act:
+        return True, "through the requesting IoT itself", "no IoT in range; the requester will act"
+    if distant_rf:
+        return True, f"distant RF IoT at light speed ({distant_rf[0]})", "no IoT in range; using a distant RF peer"
+    return False, "", "no willing IoT in range, requester can't act, no distant RF peer"
+
+
+def cyber_scan(iot_id: str, telemetry: Dict[str, Any]) -> Dict[str, Any]:
+    """Satoshi Complex, in parallel: is a cyber-physical attack spoofing, jamming
+    or tampering with the sensors to worsen or mask the violence?"""
+    packet_loss = float(telemetry.get("packet_loss", 0.0))
+    clock_skew_ms = abs(float(telemetry.get("clock_skew_ms", 0.0)))
+    jam_db = float(telemetry.get("rf_noise_db", 0.0))
+    compromised = (packet_loss > PACKET_LOSS_THRESH or clock_skew_ms > CLOCK_SKEW_MS_THRESH
+                   or jam_db > RF_NOISE_DB_THRESH)
+    if compromised:
+        logger.warning("cyber-scan compromised iot=%s loss=%.2f skew=%.1f jam=%.1f",
+                       iot_id, packet_loss, clock_skew_ms, jam_db)
+    return {"verified": not compromised, "packet_loss": packet_loss, "clock_skew_ms": clock_skew_ms,
+            "rf_noise_db": jam_db,
+            "note": "sensors look tampered: weigh cues with caution" if compromised else "sensors verified"}
+
+
+def handoff(from_iot: str, to: Any, is_emergency: bool, reason: str) -> Dict[str, Any]:
+    """Sub-second hand-off: another App that can defend, a peer IoT, or dispatch. Zero charge."""
+    target = to or "DISPATCH_GATEWAY"
+    logger.warning("handoff from=%s to=%s emergency=%s reason=%s", from_iot, target, is_emergency, reason)
+    return {"handoff_triggered": True, "from_iot": from_iot, "to": target,
+            "priority": "CRITICAL_EMERGENCY" if is_emergency else "ELEVATED",
+            "notice": (f"HAND-OFF from {from_iot}: "
+                       f"{'this IS / may be an emergency' if is_emergency else 'unverified'} - {reason}"),
+            "billed_units": 0}
+
+
+def pick_defender(other_apps: List[Dict[str, Any]]) -> Optional[str]:
+    for app in other_apps or []:
+        if app.get("can_defend"):
+            return app["name"]
+    return None
+
+
+LAW_BLOCKED = {"raw_audio", "raw_video", "raw_biometrics", "health", "name", "address",
+               "exact_location", "faces"}
+
+
+def report(iot_id: str, level: Level, confidence: float, cues: List[str],
+           stage: str, cyber: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """A minimized, lawful record for CISA / the appropriate defense office."""
+    pkt = {"recipient": "CISA / appropriate defense office",
+           "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "source_iot": iot_id, "threat_level": level.value, "confidence": confidence,
+           "cues_detected": cues, "stage": stage, "cyber_integrity_ok": cyber.get("verified", False),
+           "pii_stripped": True}
+    pkt.update({k: v for k, v in (extra or {}).items() if k not in LAW_BLOCKED})
+    return pkt
+
+
+def _validate(req: Dict[str, Any], scene: Scene) -> Optional[str]:
+    """Reject malformed input before acting. Returns an error string or None."""
+    for actor in scene.actors:
+        if not all(math.isfinite(x) for x in actor.where):
+            return f"non-finite coordinate on actor {actor.id}"
+    for ex in scene.safe_exits:
+        if not all(math.isfinite(x) for x in ex):
+            return "non-finite exit coordinate"
+    sth = req.get("seconds_to_harm")
+    if sth is not None and (not isinstance(sth, (int, float)) or sth < 0):
+        return "seconds_to_harm must be >= 0"
+    if not all(isinstance(v, (int, float)) for v in (req.get("cues") or {}).values()):
+        return "all cue values must be numeric"
+    return None
+
+
+# ===========================================================================
+# 7 · MAIN ORCHESTRATOR: one sub-second entry point
+# ===========================================================================
+def respond(acct: Account, req: Dict[str, Any], scene: Scene,
+            executor: Optional[ThreadPoolExecutor] = None,
+            handoff_hook: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    ms = lambda: round((time.perf_counter() - t0) * 1000, 2)
+    is_emergency = bool(req.get("emergency", False))
+
+    err = _validate(req, scene)
+    if err:
+        logger.error("validation failed iot=%s: %s", acct.iot_id, err)
+        ho = handoff(acct.iot_id, None, is_emergency, f"validation: {err}")
+        if handoff_hook:
+            handoff_hook(ho)
+        return {"status": "HANDOFF", "handoff": ho, "latency_ms": ms()}
+
+    receipt, status, authorized = admit(acct, req)
+    if not authorized:
+        return {"status": status, "receipt": receipt, "latency_ms": ms()}
+
+    # dead-man's switch: contact with the requesting IoT dropped
+    if req.get("link_lost"):
+        ho = handoff(acct.iot_id, (req.get("nearby_iots") or [None])[0], is_emergency,
+                     "primary IoT heartbeat lost")
+        if handoff_hook:
+            handoff_hook(ho)
+        return {"status": "HANDOFF", "handoff": ho, "latency_ms": ms()}
+
+    # can we help? a willing IoT in range, OR the requesting IoT itself, OR -
+    # searched sub-second in parallel - a distant RF/frequency IoT that deploys
+    # at light speed. Only if none can act do we hand off; IoT is NOT charged.
+    distant_rf = search_distant_rf(req.get("distant_peers", []))
+    can, deploy_path, why = capable(scene, req.get("willing_iots", []),
+                                    req.get("requester_can_act", False), distant_rf)
+    if not can:
+        ho = handoff(acct.iot_id, pick_defender(req.get("other_apps", [])), is_emergency, why)
+        acct.settle(0, 0, succeeded=False, is_emergency=is_emergency)
+        return {"status": "HANDOFF" if ho["to"] != "DISPATCH_GATEWAY" else "CANNOT_HELP",
+                "reason": why, "handoff": ho, "latency_ms": ms()}
+
+    own_pool = executor is None
+    pool = executor or ThreadPoolExecutor(max_workers=2)
+    try:
+        cyber_future = pool.submit(cyber_scan, acct.iot_id, req.get("telemetry", {}))
+        level, confidence, triggered = assess(req.get("cues", {}), req.get("phase", "imminent"))
+        cyber = cyber_future.result(timeout=0.25)
+        if not cyber.get("verified", True):                   # tampered sensors -> trust the cues less
+            confidence = round(confidence * CYBER_CONF_SCALE, 3)
+            logger.info("confidence scaled by cyber integrity -> %.3f", confidence)
+        if level in (Level.IMMINENT, Level.ONGOING):
+            is_emergency = True
+        deploy_now, timing_reason, escalate = threat_time(level, req.get("seconds_to_harm"))
+        emitter = tuple(req.get("emitter", (0.0, 0.0, 0.0)))
+        planned = plan(level, scene, deploy_now, emitter) if level != Level.NONE else {"stage": "NONE", "measures": {}}
+    except Exception as exc:                                  # timeout / error -> hand off, not charged
+        logger.exception("execution fallback iot=%s", acct.iot_id)
+        ho = handoff(acct.iot_id, pick_defender(req.get("other_apps", [])), is_emergency,
+                     f"execution fallback: {type(exc).__name__}: {exc}")
+        if handoff_hook:
+            handoff_hook(ho)
+        return {"status": "HANDOFF", "handoff": ho, "latency_ms": ms()}
+    finally:
+        if own_pool:
+            pool.shutdown(wait=False)
+
+    incident = (report(acct.iot_id, level, confidence, triggered, planned["stage"], cyber,
+                       {"phase": req.get("phase", "imminent"), "escalate_dispatch": escalate})
+                if level != Level.NONE else None)
+    succeeded = level != Level.NONE
+    billed = acct.settle(int(req.get("data_units", 10)), int(req.get("nn_units", 25)), succeeded, is_emergency)
+    logger.info("respond complete iot=%s level=%s path=%s deploy=%s billed=%d latency=%.1fms",
+                acct.iot_id, level.value, deploy_path, deploy_now, billed, ms())
+
+    return {"status": "OK", "receipt": receipt, "deploy_path": deploy_path,
+            "threat": {"level": level.value, "confidence": confidence, "cues": triggered},
+            "timing": {"deploy": deploy_now, "reason": timing_reason, "escalate_dispatch": escalate},
+            "plan": planned, "cyber_scan": cyber, "report": incident,
+            "billed_units": billed, "latency_ms": ms()}
+
+
+# ===========================================================================
+# 8 · SELF-TEST / DEMO
+# ===========================================================================
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    device = Account(iot_id="iot-cam-042")
+    scene = Scene(
+        actors=[
+            Actor("victim_1", Role.VICTIM, (-1.0, 0.0, 0.0), {"hr": 152, "hrv_ms": 15}),
+            Actor("aggressor_clear", Role.AGGRESSOR, (0.0, 1.0, 0.0)),
+            Actor("aggressor_near_cop", Role.AGGRESSOR, (1.0, 0.1, 0.0)),
+            Actor("officer_1", Role.RESPONDER, (1.0, 0.0, 0.0)),
+        ],
+        safe_exits=[(-1.0, -0.5, 0.0), (0.0, -1.0, 0.0)],
+    )
+    req = {
+        "waiver": True, "emergency": True, "phase": "ongoing", "seconds_to_harm": 1.5,
+        "willing_iots": ["speaker", "lights"],
+        "cues": {"weapon_indicated": 0.85, "cornering_a_person": 0.90,
+                 "victim_distress_biometrics": 0.80, "call_for_help": 0.70},
+        "telemetry": {"packet_loss": 0.02, "clock_skew_ms": 12.0},
+        "nearby_iots": ["iot-cam-043", "iot-light-019"],
+    }
+    with ThreadPoolExecutor(max_workers=4) as shared:
+        result = respond(device, req, scene, executor=shared)
+    print(json.dumps(result, indent=2, default=str))
+    print(f"\nunits after the emergency: {device.units} (charged {device.charged_total})")
