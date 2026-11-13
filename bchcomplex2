@@ -1,0 +1,962 @@
+"""
+BCH Complex · INFECTION PREVENTION
+Hardened Reference Framework (v2)
+================================================================================
+
+PURPOSE
+    Keeps a specific user (or household) out of the wrong place at the wrong
+    time — locations and moments where an exposure that is mild for most people
+    can produce a severe, incurable, or fatal outcome for them. One call after
+    waiver:
+
+    1. Assesses objective environmental hazard at the place + time.
+    2. Applies the user's own susceptibility (in-memory only) to produce a
+       personalized risk of severe outcome and a forecast of when that line
+       is crossed for them.
+    3. In HOME mode, identifies in-home hazards and returns a concrete fix plan.
+    4. Returns a PROBABILITY OF INFECTION for this user (a saturating estimate
+       from their personalized exposure; the slope is an input, not an invented
+       constant) alongside a clear recommendation:
+         DO_NOT_GO  — personalized severe-outcome risk at this place/time
+         SAFE_TO_GO — no elevated personalized risk, with certainty
+         FIX_HOME   — home hazard(s) and how to remediate
+    5. Notifies venue operators / public health when the public is at risk
+       (lawful, non-protected data only). Device faults escalate to makers.
+    6. Contributes only anonymous environmental features to the shared
+       data + neural-net library (never the user's health) so every participant
+       earns: data in $BTC, neural-net runs in $BCH.
+
+PROVENANCE
+    Draft (Claude) -> review (Google) -> hardening (Grok) -> merged, plus the
+    probability-of-infection output. One file, a reference FRAMEWORK for a tech
+    employee to build on: detection, personalization, the monetizable library,
+    comms and billing.
+
+PRIVACY (non-negotiable)
+    Susceptibility (genetics, receptor profile, immune status, comorbidities,
+    health_status, etc.) is the most protected data. It is used only in memory
+    for this call to personalize risk, then fully purged. It is never stored,
+    never logged, and never used as a training feature. A hash of protected
+    data is still protected. Only allow-listed, non-protected environmental
+    facts are retained.
+
+PAYMENT
+    Data units → $BTC
+    Neural-net units → $BCH
+    Verified emergency (signed attestation or confirmed high personalized risk) = free.
+    Failed or insufficient request = zero charge.
+
+DISCLAIMER
+    Informational only. Not medical advice or diagnosis. Consult a qualified
+    professional. AI-generated code may contain errors.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import math
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger("bch_complex.infection")
+
+MIN_WINDOW_S = 0.25
+MAX_WINDOW_S = 1.0
+AVOID_RATIO = 1.0
+INFECTION_K = 0.8          # response of P(infection) to personalized exposure (an input)
+MIN_SUSCEPTIBILITY_FLOOR = 0.5
+MAX_SUSCEPTIBILITY_CAP = 20.0
+
+
+# ---------------------------------------------------------------------------
+# 1 · Admission & settlement
+# ---------------------------------------------------------------------------
+PLANS: Dict[str, Tuple[int, Tuple[str, ...]]] = {
+    "5": (2_000, ("USD", "BCH")),
+    "25": (12_500, ("USD", "BTC", "BCH", "top chain")),
+}
+
+
+@dataclass
+class Account:
+    iot_id: str
+    units: int = 0
+    plan: str = ""
+    charged_total: int = 0
+
+    def buy(self, plan: str, currency: str) -> None:
+        if plan not in PLANS:
+            raise ValueError(f"unknown plan '{plan}'")
+        units, accepted = PLANS[plan]
+        if currency not in accepted:
+            raise ValueError(f"${plan} plan accepts only {', '.join(accepted)}")
+        self.units += units
+        self.plan = plan
+
+    def settle(
+        self,
+        data_units_btc: int,
+        nn_units_bch: int,
+        succeeded: bool,
+        verified_emergency: bool,
+    ) -> int:
+        if verified_emergency or not succeeded:
+            return 0
+        used = min(max(0, data_units_btc) + max(0, nn_units_bch), self.units)
+        self.units -= used
+        self.charged_total += used
+        return used
+
+
+def verify_emergency(req: Dict[str, Any], risks: Optional[List["Risk"]] = None) -> bool:
+    if not req.get("emergency"):
+        return False
+    return bool(req.get("emergency_attestation_token")) or bool(
+        risks and any(r.elevated and r.level == "high" for r in risks)
+    )
+
+
+def admit(acct: Account, req: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+    if not req.get("waiver"):
+        return None, "DECLINED: waiver not approved", False
+    if req.get("emergency") and req.get("emergency_attestation_token"):
+        return {
+            "offer": "PROVISIONAL_EMERGENCY_FREE",
+            "terms": "verified emergency: no charge; standard rates if unverified",
+        }, "OK", True
+    if acct.units > 0:
+        return {"offer": f"plan ${acct.plan}", "units_left": acct.units}, "OK", True
+    return {
+        "offer": "choose_plan",
+        "options": [
+            "$5 USD/BCH = 2,000 units",
+            "$25 USD/BTC/BCH/top chain = 12,500 units",
+        ],
+    }, "NEEDS_PLAN", False
+
+
+# ---------------------------------------------------------------------------
+# 2 · Privacy
+# ---------------------------------------------------------------------------
+PROTECTED: Set[str] = {
+    "name", "mrn", "dob", "ssn", "address", "face", "diagnosis", "raw_vitals",
+    "genetic", "genotype", "clinical_note", "photo", "patient_id", "case_id",
+    "person_id", "biometric_hash", "phi", "pii", "health_status", "infected_person",
+    "ace2", "ace2_affinity", "immune_status", "comorbidity", "susceptibility_markers",
+    "household_member", "susceptibility",
+}
+
+
+def for_storage(record: Dict[str, Any], allow_keys: List[str]) -> Dict[str, Any]:
+    allow = {k.lower() for k in allow_keys}
+    return {k: v for k, v in record.items() if k.lower() in allow and k.lower() not in PROTECTED}
+
+
+def extract_and_purge_protected(payload: Any, found: Optional[Set[str]] = None) -> List[str]:
+    if found is None:
+        found = set()
+    if isinstance(payload, dict):
+        for k in list(payload.keys()):
+            if k.lower() in PROTECTED:
+                found.add(k)
+                if isinstance(payload[k], dict):
+                    for sub_k in list(payload[k].keys()):
+                        payload[k][sub_k] = None
+                payload[k] = None
+                del payload[k]
+            else:
+                extract_and_purge_protected(payload[k], found)
+    elif isinstance(payload, list):
+        for item in payload:
+            extract_and_purge_protected(item, found)
+    return sorted(found)
+
+
+# ---------------------------------------------------------------------------
+# 3 · Place, risk model, and detectors
+# ---------------------------------------------------------------------------
+@dataclass
+class Place:
+    id: str
+    kind: str  # outdoor | venue | room | water_source | home | zone
+    where: Optional[Tuple[float, float, float]] = None
+
+    def public_id(self) -> str:
+        return "REDACTED_HOME_ZONE" if self.kind.lower() == "home" else self.id
+
+
+class RiskKind(str, Enum):
+    AIR = "airborne pathogen / ventilation"
+    SURFACE = "surface contamination"
+    WATER = "water contamination"
+    TRANSMISSION = "person-to-person transmission"
+    HOME = "home hazard"
+
+
+PATHWAY = {
+    RiskKind.AIR: "airborne",
+    RiskKind.SURFACE: "surface",
+    RiskKind.WATER: "waterborne",
+    RiskKind.TRANSMISSION: "transmission",
+    RiskKind.HOME: "airborne",
+}
+
+
+@dataclass
+class Risk:
+    kind: RiskKind
+    elevated: bool
+    level: str  # none | low | elevated | high
+    certainty: float
+    env_ratio: float = 0.0
+    personal_ratio: float = 0.0
+    susceptibility: float = 1.0
+    cause: str = ""
+    source: str = ""
+    seconds_to_threshold: Optional[float] = None
+    iot_can_do: List[str] = field(default_factory=list)
+    detail: str = ""
+    valid_check: bool = True
+    infection_probability: float = 0.0     # estimated P(infection) for THIS user
+    env_features: List[float] = field(default_factory=list)
+
+
+def _certainty(window_s: float, sensor_conf: float, corroborating: int) -> float:
+    w = max(0.0, min(1.0, (window_s - MIN_WINDOW_S) / (MAX_WINDOW_S - MIN_WINDOW_S) + 0.4))
+    c = max(0.0, min(1.0, sensor_conf))
+    return round(min(1.0, 0.5 * w + 0.4 * c + 0.1 * min(2, max(0, corroborating))), 2)
+
+
+def _forecast(value: float, limit: float, rate_per_s: Optional[float]) -> Optional[float]:
+    if value >= limit:
+        return 0.0
+    if not rate_per_s or rate_per_s <= 0:
+        return None
+    return round((limit - value) / rate_per_s, 1)
+
+
+def _nums(*xs) -> bool:
+    return all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in xs)
+
+
+def _invalid(kind: RiskKind, why: str) -> Risk:
+    return Risk(kind, False, "none", 0.0, detail=why, valid_check=False)
+
+
+def _mk(
+    kind: RiskKind,
+    env_ratio: float,
+    window_s: float,
+    r: Dict[str, Any],
+    cause: str,
+    source: str,
+    actions: List[str],
+    detail: str,
+    fc: Optional[float] = None,
+    features: Optional[List[float]] = None,
+) -> Risk:
+    cert = _certainty(window_s, r.get("sensor_conf", 0.8), r.get("sources", 1))
+    return Risk(
+        kind,
+        False,
+        "none",
+        cert,
+        env_ratio=round(env_ratio, 2),
+        cause=cause,
+        source=source,
+        seconds_to_threshold=fc,
+        iot_can_do=actions,
+        detail=detail,
+        env_features=features or [round(env_ratio, 4), cert],
+    )
+
+
+def check_air(r: Dict[str, Any], window_s: float) -> Risk:
+    load, limit = r.get("airborne_pathogen"), r.get("airborne_limit")
+    if not _nums(load, limit) or limit <= 0 or load < 0:
+        return _invalid(RiskKind.AIR, "missing/invalid air metrics")
+
+    ach, min_ach = r.get("ach"), r.get("min_ach")
+    poor_vent = _nums(ach, min_ach) and ach < min_ach
+    bz = max(1.0, float(r.get("breathing_zone_factor", 1.0)))
+
+    # Micro-conditions that concentrate risk at nose level
+    temp_factor = 1.0
+    if _nums(r.get("temp_c"), r.get("temp_ref_c")):
+        # Cooler air can increase aerosol persistence in many indoor settings
+        delta = r["temp_ref_c"] - r["temp_c"]
+        temp_factor = 1.0 + max(0.0, min(0.4, delta * 0.05))
+
+    wind_factor = 1.0
+    if _nums(r.get("wind_ms")):
+        # Low wind allows longer residence time of infectious aerosol
+        wind_factor = 1.0 + max(0.0, min(0.5, (1.5 - r["wind_ms"]) * 0.2))
+
+    vent_mult = 1.5 if poor_vent else 1.0
+    eff = load * vent_mult * bz * temp_factor * wind_factor
+    fc = _forecast(eff, limit, r.get("trend_per_s"))
+
+    notes = []
+    if poor_vent:
+        notes.append("ventilation below minimum")
+    if bz > 1.0:
+        notes.append("air pooling at nose level")
+    if temp_factor > 1.05:
+        notes.append("temperature favoring persistence")
+    if wind_factor > 1.05:
+        notes.append("low air movement")
+
+    return _mk(
+        RiskKind.AIR,
+        eff / limit,
+        window_s,
+        r,
+        "device" if r.get("hvac_fault") else "facility",
+        r.get("zone", "ward air"),
+        [
+            "boost filtration / fresh-air exchange",
+            "raise ventilation",
+            "limit occupancy",
+            "alert facilities + HVAC maker",
+        ],
+        f"airborne {eff:.1f} vs limit {limit}" + (f" · {'; '.join(notes)}" if notes else ""),
+        fc,
+        features=[round(load / limit, 4), vent_mult, round(bz, 4), round(temp_factor, 4), round(wind_factor, 4)],
+    )
+
+
+def check_surface(r: Dict[str, Any], window_s: float) -> Risk:
+    idx, thresh = r.get("contamination_index"), r.get("sanitize_threshold")
+    if not _nums(idx, thresh) or thresh <= 0 or idx < 0:
+        return _invalid(RiskKind.SURFACE, "missing/invalid surface metrics")
+    ratio = idx / thresh
+    return _mk(
+        RiskKind.SURFACE,
+        ratio,
+        window_s,
+        r,
+        "device" if r.get("on_equipment") else "facility",
+        r.get("surface", "surface"),
+        [
+            "flag for immediate sanitization",
+            "take item / area out of use",
+            "alert environmental services",
+        ],
+        f"surface index {idx} vs threshold {thresh} on {r.get('surface', 'surface')}",
+        _forecast(idx, thresh, r.get("trend_per_s")),
+        features=[round(ratio, 4), float(r.get("sources", 1))],
+    )
+
+
+def check_water(r: Dict[str, Any], window_s: float) -> Risk:
+    metrics = ("coliform", "turbidity_ntu", "waterborne_pathogen")
+    pairs = [
+        (m, r[m], r[f"{m}_limit"])
+        for m in metrics
+        if m in r
+        and f"{m}_limit" in r
+        and _nums(r.get(m), r.get(f"{m}_limit"))
+        and r[f"{m}_limit"] > 0
+        and r[m] >= 0
+    ]
+    if not pairs:
+        return _invalid(RiskKind.WATER, "no valid water metric/limit pairs")
+    m, v, lim = max(pairs, key=lambda p: p[1] / p[2])
+    breaches = [k for k, val, l in pairs if val > l]
+    ratio = v / lim
+    return _mk(
+        RiskKind.WATER,
+        ratio,
+        window_s,
+        r,
+        "device" if r.get("treatment_fault") else "environmental",
+        r.get("source", "water source"),
+        [
+            "issue a do-not-use / boil-water notice",
+            "shut affected line / fixture",
+            "alert water operator + public health",
+        ],
+        f"over limit: {', '.join(breaches) or m} at {r.get('source', 'the source')}",
+        _forecast(v, lim, r.get("trend_per_s")),
+        features=[round(ratio, 4), float(len(breaches))],
+    )
+
+
+def check_transmission(r: Dict[str, Any], window_s: float) -> Risk:
+    density = r.get("density_per_m2", 0.0)
+    d_limit = r.get("density_limit", float("inf"))
+    if not isinstance(density, (int, float)) or density < 0 or d_limit <= 0:
+        return _invalid(RiskKind.TRANSMISSION, "invalid density")
+    d_ratio = density / d_limit if d_limit != float("inf") else 0.0
+    case_flag = 1.0 if r.get("known_case_present") else 0.0
+    vent_flag = 1.0 if r.get("poor_ventilation") else 0.0
+    score = d_ratio + (0.8 * case_flag) + (0.5 * vent_flag)
+    return _mk(
+        RiskKind.TRANSMISSION,
+        score,
+        window_s,
+        r,
+        "facility",
+        r.get("zone", "the area"),
+        [
+            "reduce occupancy / space people out",
+            "boost ventilation",
+            "mask / distance guidance",
+            "clean high-touch points",
+        ],
+        f"crowding{' + known case' if case_flag else ''}{' + poor air' if vent_flag else ''} in {r.get('zone', 'the area')}",
+        features=[round(d_ratio, 4), case_flag, vent_flag],
+    )
+
+
+def check_home_all(r: Dict[str, Any], window_s: float) -> List[Risk]:
+    hazards = {
+        "bathroom_contamination": (
+            "unsanitary bathroom",
+            ["deep-clean + disinfect the bathroom", "fix any leak / standing water", "improve exhaust ventilation"],
+        ),
+        "basement_mold": (
+            "basement mold",
+            ["dry the source + run a dehumidifier", "remediate the mold (seal / remove)", "fix water intrusion"],
+        ),
+        "damp_index": (
+            "chronic damp",
+            ["find and stop the moisture source", "ventilate + dehumidify", "inspect for hidden mold"],
+        ),
+    }
+    found: List[Risk] = []
+    for key, (label, fix) in hazards.items():
+        v, lim = r.get(key), r.get(f"{key}_limit")
+        if _nums(v, lim) and lim > 0 and v >= 0:
+            ratio = v / lim
+            item = _mk(
+                RiskKind.HOME,
+                ratio,
+                window_s,
+                r,
+                "home",
+                label,
+                fix,
+                f"{label}: {key} {v} vs limit {lim}",
+                features=[round(ratio, 4)],
+            )
+            found.append(item)
+    if not found:
+        return [_invalid(RiskKind.HOME, "no valid home hazard metric/limit pairs")]
+    return found
+
+
+LEGIT_CONTROLLED = {"containment_lab", "sterilization_cycle", "sealed_isolation", "running_autoclave"}
+
+
+# ---------------------------------------------------------------------------
+# 4 · Personalize (hazard × this user's susceptibility)
+# ---------------------------------------------------------------------------
+def _p_infect(personal_ratio: float, k: float = INFECTION_K) -> float:
+    """Estimated probability of infection for this user, from their personalized
+    exposure. A saturating curve (0 at no exposure -> ~1 as it grows); the slope k
+    is an input from a validated model, not an epidemiological constant invented
+    here. This is an ESTIMATE, not a clinical probability."""
+    return round(1.0 - math.exp(-max(0.0, float(k)) * max(0.0, personal_ratio)), 3)
+
+
+def personalize(risk: Risk, susceptibility: Dict[str, float]) -> Risk:
+    raw_mult = susceptibility.get(PATHWAY[risk.kind], susceptibility.get("overall", 1.0))
+    if not _nums(raw_mult):
+        raw_mult = 1.0
+    mult = max(MIN_SUSCEPTIBILITY_FLOOR, min(MAX_SUSCEPTIBILITY_CAP, float(raw_mult)))
+    risk.susceptibility = round(mult, 2)
+    risk.personal_ratio = round(risk.env_ratio * mult, 2)
+    pr = risk.personal_ratio
+    risk.level = (
+        "high" if pr >= 2.0 * AVOID_RATIO
+        else "elevated" if pr >= AVOID_RATIO
+        else "low" if pr >= 0.7 * AVOID_RATIO
+        else "none"
+    )
+    risk.elevated = pr >= AVOID_RATIO
+    k = susceptibility.get("infectivity_k", INFECTION_K)
+    risk.infection_probability = _p_infect(pr, k if _nums(k) else INFECTION_K)
+
+    # Personalized forecast: when does THIS user cross their avoid line?
+    if risk.seconds_to_threshold is not None and mult > 0 and risk.env_ratio < AVOID_RATIO:
+        # Scale remaining headroom by susceptibility
+        remaining_ratio = max(0.0, AVOID_RATIO / mult - risk.env_ratio)
+        if remaining_ratio > 0 and risk.seconds_to_threshold > 0:
+            # Approximate proportional adjustment (conservative)
+            risk.seconds_to_threshold = round(risk.seconds_to_threshold * (remaining_ratio / max(0.01, AVOID_RATIO - risk.env_ratio)), 1)
+    return risk
+
+
+# ---------------------------------------------------------------------------
+# 5 · Data + neural-net library (environmental features only)
+# ---------------------------------------------------------------------------
+class Library:
+    def __init__(self, max_samples_per_pathway: int = 500, retrain_every: int = 10) -> None:
+        self.records: List[Dict[str, Any]] = []
+        self.max_samples = max_samples_per_pathway
+        self.retrain_every = retrain_every
+        self.X: Dict[str, Deque[List[float]]] = {}
+        self.y: Dict[str, Deque[int]] = {}
+        self.sample_counts: Dict[str, int] = {}
+        self.nets: Dict[str, Any] = {}
+        self.earnings: Dict[str, int] = {"$BTC": 0, "$BCH": 0}
+        self.credited: Dict[str, Dict[str, int]] = {}
+
+    def _credit(self, iot: str, currency: str, n: int) -> None:
+        self.earnings[currency] += n
+        self.credited.setdefault(iot, {"$BTC": 0, "$BCH": 0})[currency] += n
+
+    def record(self, fields: Dict[str, Any], from_iots: List[str]) -> int:
+        safe = {k: v for k, v in fields.items() if k.lower() not in PROTECTED}
+        self.records.append(safe)
+        for io in from_iots or ["requesting_iot"]:
+            self._credit(io, "$BTC", 1)
+        return len(self.records)
+
+    def learn(self, pathway: str, env_features: List[float], env_breached: bool, force_fit: bool = False) -> None:
+        X = self.X.setdefault(pathway, deque(maxlen=self.max_samples))
+        y = self.y.setdefault(pathway, deque(maxlen=self.max_samples))
+        X.append([float(f) for f in env_features])
+        y.append(int(env_breached))
+        count = self.sample_counts.get(pathway, 0) + 1
+        self.sample_counts[pathway] = count
+
+        if (
+            len(set(y)) == 2
+            and len(y) >= 6
+            and (force_fit or count % self.retrain_every == 0 or pathway not in self.nets)
+        ):
+            try:
+                from sklearn.neural_network import MLPClassifier
+                self.nets[pathway] = MLPClassifier((16,), max_iter=500, random_state=0).fit(list(X), list(y))
+            except Exception:
+                logger.info("library: neural net unavailable; environmental data retained")
+
+    def predict(self, pathway: str, env_features: List[float], iot: str = "model_owner") -> Optional[float]:
+        net = self.nets.get(pathway)
+        if net is None:
+            return None
+        self._credit(iot, "$BCH", 1)
+        try:
+            return round(float(net.predict_proba([[float(f) for f in env_features]])[0, 1]), 3)
+        except Exception:
+            return None
+
+    def monetization(self) -> Dict[str, Any]:
+        return {
+            "records": len(self.records),
+            "trained_models": sorted(self.nets),
+            "earnings": dict(self.earnings),
+            "iots_credited": self.credited,
+        }
+
+
+LIBRARY = Library()
+
+
+# ---------------------------------------------------------------------------
+# 6 · COMMS & reporting
+# ---------------------------------------------------------------------------
+def comms_broadcast(
+    nearby_iots: List[Dict[str, Any]], elevated: List[Risk], place: Place, emergency: bool
+) -> List[Dict[str, Any]]:
+    head = (
+        "EMERGENCY: a real exposure risk right now"
+        if emergency
+        else "CONFIRMATION: elevated risk detected at this place"
+    )
+    msgs = []
+    for io in nearby_iots:
+        caps = [str(c).lower() for c in io.get("can_help_with", [])]
+        wanted = [r for r in elevated if r.kind.name.lower() in caps or "any" in caps]
+        if not wanted:
+            continue
+        msgs.append({
+            "to": io.get("name", "unknown_iot"),
+            "header": head,
+            "location": place.public_id(),
+            "about": [r.kind.value for r in wanted],
+            "we_ask": sorted({a for r in wanted for a in r.iot_can_do}),
+            "you_earn": "$BTC for data shared · $BCH for a neural-net run",
+        })
+    return msgs
+
+
+def ask_nearby(nearby_iots: List[Dict[str, Any]], risk: Risk) -> List[Dict[str, Any]]:
+    target = risk.kind.name.lower()
+    out = []
+    for io in nearby_iots:
+        caps = [str(c).lower() for c in io.get("can_help_with", [])]
+        if target in caps or "any" in caps:
+            out.append({
+                "iot": io.get("name", "unknown_iot"),
+                "request": "help prevent this exposure",
+                "provided": {"data": "$BTC data units", "neural_net": "$BCH NN units"},
+                "earns": True,
+            })
+    return out
+
+
+def escalate(risk: Risk, venue: Dict[str, Any], prevention: str, event_id: str) -> Optional[Dict[str, Any]]:
+    if not risk.elevated:
+        return None
+    if risk.cause == "device":
+        to, level = venue.get("device_makers", {}).get(risk.source, "the device maker"), "device maker"
+    elif risk.cause == "environmental":
+        to, level = venue.get("water_operator", "the water operator"), "water operator / utility"
+    elif risk.cause == "home":
+        to, level = "the requesting IoT / resident", "household"
+    else:
+        to, level = venue.get("name", "the facility operator"), "facility operator"
+    return {
+        "event_id": event_id,
+        "to": to,
+        "level": level,
+        "about": risk.kind.value,
+        "level_of_risk": risk.level,
+        "source": risk.source,
+        "prevention": prevention,
+        "contains_protected_data": False,
+    }
+
+
+def notify_public_health(
+    risks: List[Risk], place: Place, venue: Dict[str, Any], storable: Dict[str, Any], event_id: str
+) -> Optional[Dict[str, Any]]:
+    public = [
+        r for r in risks
+        if r.elevated and r.cause != "home" and (r.level == "high" or r.kind in (RiskKind.WATER, RiskKind.AIR))
+    ]
+    if not public:
+        return None
+    return {
+        "event_id": event_id,
+        "command_center": "BCH Complex Real-Time Command",
+        "to": [venue.get("name", "the operator"), "public health"],
+        "about": [r.kind.value for r in public],
+        "location": place.public_id(),
+        "location_kind": place.kind,
+        "lawful_payload": storable,
+        "protected_data_withheld": True,
+    }
+
+
+PREVENTION = {
+    RiskKind.AIR: "continuous air + ventilation monitoring, auto filtration boost, HVAC servicing",
+    RiskKind.SURFACE: "tighter sanitization cadence + contamination sensing at the point of use",
+    RiskKind.WATER: "backflow / sewer isolation, source monitoring, a tested do-not-use trigger",
+    RiskKind.TRANSMISSION: "occupancy limits, ventilation, and high-touch cleaning schedules",
+    RiskKind.HOME: "fix the moisture/sanitation source, ventilate, and re-test",
+}
+
+
+# ---------------------------------------------------------------------------
+# 7 · Main orchestrator
+# ---------------------------------------------------------------------------
+def respond(
+    acct: Account,
+    req: Dict[str, Any],
+    place: Place,
+    data: Dict[str, Any],
+    nearby_iots: Optional[List[Dict[str, Any]]] = None,
+    venue: Optional[Dict[str, Any]] = None,
+    library: Optional[Library] = None,
+) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    def ms() -> float:
+        return round((time.perf_counter() - t0) * 1000, 2)
+
+    event_id = str(uuid.uuid4())
+    timestamp_utc = datetime.now(timezone.utc).isoformat()
+    nearby_iots = nearby_iots or []
+    venue = venue or {}
+    library = library if library is not None else LIBRARY
+    from_iots = req.get("data_from_iots", [])
+    working = copy.deepcopy(data)
+
+    receipt: Optional[Dict[str, Any]] = None
+    storable: Dict[str, Any] = {}
+    earners: List[str] = []
+    billed = 0
+
+    out: Dict[str, Any] = {
+        "event_id": event_id,
+        "timestamp_utc": timestamp_utc,
+        "location": place.public_id(),
+        "location_kind": place.kind,
+        "time_requested": req.get("time", timestamp_utc),
+    }
+
+    try:
+        receipt, status, authorized = admit(acct, req)
+        if not authorized:
+            out.update({"status": status, "receipt": receipt, "latency_ms": ms()})
+            return out
+
+        try:
+            window_s = float(req.get("window_s", 0.5))
+        except (TypeError, ValueError):
+            window_s = 0.5
+
+        if window_s < MIN_WINDOW_S:
+            out.update({"status": "NEED_MORE_DATA", "need_at_least_s": MIN_WINDOW_S, "latency_ms": ms()})
+            return out
+        window_s = min(window_s, MAX_WINDOW_S)
+
+        controlled = req.get("controlled_activity") in LEGIT_CONTROLLED
+        susceptibility = working.get("susceptibility", {}) if isinstance(working.get("susceptibility"), dict) else {}
+
+        risks: List[Risk] = []
+        single_detectors = (
+            ("air", check_air),
+            ("surface", check_surface),
+            ("water", check_water),
+            ("transmission", check_transmission),
+        )
+        for key, fn in single_detectors:
+            if key not in working:
+                continue
+            block = working[key]
+            if not isinstance(block, dict):
+                risks.append(_invalid(RiskKind.AIR, f"{key}: expected an object"))
+                continue
+            r = fn(block, window_s)
+            if r.valid_check:
+                personalize(r, susceptibility)
+            risks.append(r)
+
+        if "home" in working:
+            block = working["home"]
+            if not isinstance(block, dict):
+                risks.append(_invalid(RiskKind.HOME, "home: expected an object"))
+            else:
+                for hr in check_home_all(block, window_s):
+                    if hr.valid_check:
+                        personalize(hr, susceptibility)
+                    risks.append(hr)
+
+        valid = [r for r in risks if r.valid_check]
+        if not valid:
+            out.update({
+                "status": "INSUFFICIENT_OR_INVALID_DATA",
+                "confirmed_safe": False,
+                "billed_units": 0,
+                "latency_ms": ms(),
+            })
+            return out
+
+        elevated = [] if controlled else [r for r in valid if r.elevated]
+        home_hazards = [r for r in elevated if r.cause == "home"]
+        away_hazards = [r for r in elevated if r.cause != "home"]
+
+        raw_storable = {
+            "event_id": event_id,
+            "timestamp_utc": timestamp_utc,
+            "location_kind": place.kind,
+            "risk_kinds": [r.kind.value for r in elevated],
+            "levels": [r.level for r in elevated],
+            "device_models": sorted({r.source for r in elevated if r.cause == "device" and r.source}),
+            "window_s": window_s,
+        }
+        storable = for_storage(raw_storable, list(raw_storable.keys()))
+
+        library.record(storable, from_iots)
+        model_check = {}
+        for r in valid:
+            pathway_key = f"{place.kind}:{PATHWAY[r.kind]}"
+            env_breached = r.env_ratio >= AVOID_RATIO
+            library.learn(pathway_key, r.env_features, env_breached)
+            p = library.predict(pathway_key, r.env_features)
+            if p is not None:
+                model_check[r.kind.value] = p
+
+        comms = comms_broadcast(nearby_iots, away_hazards, place, bool(req.get("emergency")))
+        help_requests = [{"risk": r.kind.value, "asked": ask_nearby(nearby_iots, r)} for r in away_hazards]
+        earners = sorted({a["iot"] for h in help_requests for a in h["asked"]})
+        reports = [x for x in (escalate(r, venue, PREVENTION[r.kind], event_id) for r in elevated) if x]
+        public_health = notify_public_health(elevated, place, venue, storable, event_id)
+
+        verified = verify_emergency(req, valid)
+        billed = acct.settle(1 + len(earners), 2 * max(1, len(elevated)), True, verified)
+        certainty = min((r.certainty for r in valid), default=0.0)
+        # overall probability of infection for this user: chance ANY route infects.
+        # recognized controlled activity is contained, so it carries ~0 probability.
+        p_each = [] if controlled else [r.infection_probability for r in valid]
+        p_infection = round(1.0 - math.prod(1.0 - p for p in p_each), 3) if p_each else 0.0
+
+        if home_hazards and not away_hazards:
+            recommendation = "FIX_HOME"
+        elif away_hazards:
+            recommendation = "DO_NOT_GO"
+        else:
+            recommendation = "SAFE_TO_GO"
+
+        out.update({
+            "status": "OK",
+            "recommendation": recommendation,
+            "certainty_percent": round(100 * certainty),
+            "probability_of_infection": p_infection,
+            "probability_of_infection_percent": round(100 * p_infection),
+            "recognized_controlled_activity": controlled,
+            "library_corroboration": model_check or None,
+            "library_monetization": library.monetization(),
+        })
+
+        if recommendation == "SAFE_TO_GO":
+            fts = [r.seconds_to_threshold for r in valid if r.seconds_to_threshold not in (None, 0.0)]
+            out.update({
+                "confirmed_safe": True,
+                "safe_until_s": min(fts) if fts else None,
+                "checks_run": [r.kind.value for r in valid],
+                "message": f"no problem detected at {place.public_id()} for this user; "
+                           f"probability of infection {round(100 * p_infection)}%, certainty {round(100 * certainty)}%",
+            })
+        else:
+            out.update({
+                "confirmed_safe": False,
+                "risks": [
+                    {
+                        "kind": r.kind.value,
+                        "level": r.level,
+                        "certainty": r.certainty,
+                        "env_ratio": r.env_ratio,
+                        "your_susceptibility": r.susceptibility,
+                        "personal_ratio": r.personal_ratio,
+                        "probability_of_infection": r.infection_probability,
+                        "cause": r.cause,
+                        "source": r.source,
+                        "seconds_to_threshold": r.seconds_to_threshold,
+                        "iot_can_do": r.iot_can_do,
+                        "detail": r.detail,
+                    }
+                    for r in elevated
+                ],
+                "home_fix": [{"hazard": r.source, "level": r.level, "fix": r.iot_can_do} for r in home_hazards] or None,
+                "comms_to_nearby_iots": comms,
+                "nearby_iots_asked_to_help": help_requests,
+                "reports_up_the_chain": reports,
+                "public_health_notified": public_health,
+                "message": (
+                    "avoid this place at this time" if recommendation == "DO_NOT_GO" else "fix the home hazard(s)"
+                ) + f" · probability of infection {round(100 * p_infection)}% · certainty {round(100 * certainty)}%",
+            })
+
+        logger.info(
+            "infection respond event=%s iot=%s loc=%s rec=%s elevated=%d billed=%d %.2fms",
+            event_id, acct.iot_id, place.public_id(), recommendation, len(elevated), billed, ms(),
+        )
+        return out
+
+    except Exception as exc:
+        logger.exception("infection respond fallback event=%s iot=%s", event_id, acct.iot_id)
+        out.update({"status": "FAILED_SAFE", "reason": type(exc).__name__, "confirmed_safe": False, "billed_units": 0})
+        return out
+
+    finally:
+        protected_seen = extract_and_purge_protected(working)
+        out.update({
+            "receipt": receipt,
+            "stored_monetizable": storable,
+            "protected_used_not_stored": protected_seen,
+            "iots_earning": earners,
+            "billed_units": billed,
+            "latency_ms": ms(),
+        })
+
+
+# ---------------------------------------------------------------------------
+# 8 · Self-test / demo
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    acct = Account("home-hub-9")
+    acct.buy("25", "BCH")
+    venue = {"name": "Riverside Community Center", "water_operator": "City Water Dept"}
+    nearby = [
+        {"name": "venue air unit", "can_help_with": ["air"]},
+        {"name": "water valve", "can_help_with": ["water"]},
+    ]
+
+    place = Place("riverside-hall", "venue", where=(30.0, 5.0, 0.0))
+    data = {
+        "susceptibility": {"airborne": 3.0, "waterborne": 1.5, "overall": 1.2},
+        "ace2_affinity": "REDACTED-HIGH",
+        "immune_status": "REDACTED",
+        "air": {
+            "airborne_pathogen": 20,
+            "airborne_limit": 50,
+            "ach": 2,
+            "min_ach": 6,
+            "breathing_zone_factor": 1.4,
+            "temp_c": 18.0,
+            "temp_ref_c": 22.0,
+            "wind_ms": 0.3,
+            "trend_per_s": 2.0,
+            "zone": "main hall",
+            "sensor_conf": 0.85,
+        },
+        "water": {"coliform": 6, "coliform_limit": 10, "source": "hall supply", "sensor_conf": 0.9},
+    }
+    req = {
+        "waiver": True,
+        "emergency": True,
+        "emergency_attestation_token": "signed-op-token",
+        "window_s": 0.7,
+        "time": "2026-11-13T18:00:00-06:00",
+        "data_from_iots": ["venue air unit", "water valve"],
+    }
+
+    lib = Library()
+    for i in range(8):
+        safe = i % 2 == 0
+        respond(
+            Account(f"hub-{i}"),
+            req,
+            place,
+            {
+                "susceptibility": {"airborne": 1.0 if safe else 3.0},
+                "air": {
+                    "airborne_pathogen": 8 if safe else 20 + i,
+                    "airborne_limit": 50,
+                    "ach": 8 if safe else 2,
+                    "min_ach": 6,
+                    "breathing_zone_factor": 1.0 if safe else 1.4,
+                    "sensor_conf": 0.85,
+                },
+            },
+            nearby,
+            venue,
+            library=lib,
+        )
+
+    out = respond(acct, req, place, data, nearby, venue, library=lib)
+    print(json.dumps(out, indent=2, default=str))
+
+    print("=== HOME CHECK (same user) ===")
+    home = respond(
+        acct,
+        {"waiver": True, "window_s": 0.6, "scope": "home"},
+        Place("user-home", "home"),
+        {
+            "susceptibility": {"airborne": 3.0},
+            "ace2_affinity": "REDACTED",
+            "home": {
+                "bathroom_contamination": 9,
+                "bathroom_contamination_limit": 5,
+                "basement_mold": 7,
+                "basement_mold_limit": 4,
+            },
+        },
+        [],
+        {"name": "home"},
+        library=lib,
+    )
+    print(json.dumps(home, indent=2, default=str))
