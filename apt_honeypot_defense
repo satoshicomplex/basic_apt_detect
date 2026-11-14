@@ -1,0 +1,348 @@
+import hashlib
+import hmac
+import math
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Deque, Dict, Optional, Set, Tuple
+
+
+class AlertSeverity(Enum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+    EMERGENCY = "EMERGENCY"
+
+
+@dataclass
+class BiometricEvent:
+    subject_id: str
+    biometric_hash: str
+    liveness_score: float           # 0.0–1.0
+    source_node: str
+    timestamp: float                # sender-reported time (untrusted)
+    behavioral_stress_index: float  # 0.0–1.0
+    sequence_id: Optional[str] = None
+
+
+@dataclass
+class AlgorithmState:
+    model_weights_hash: str
+    authorized_target_list_hash: str
+    human_in_the_loop_active: bool
+    signature: Optional[str] = None  # HMAC-SHA256 over canonical_bytes()
+
+    def canonical_bytes(self) -> bytes:
+        return (f"{self.model_weights_hash}|{self.authorized_target_list_hash}|"
+                f"{int(self.human_in_the_loop_active)}").encode()
+
+
+def sign_state(state: AlgorithmState, key: bytes) -> str:
+    return hmac.new(key, state.canonical_bytes(), hashlib.sha256).hexdigest()
+
+
+@dataclass
+class DetectorConfig:
+    # Liveness: below the hard floor is a strong sign of a synthetic sample;
+    # between floor and threshold is often just a poor sensor read
+    liveness_threshold: float = 0.85
+    liveness_hard_floor: float = 0.50
+    stress_threshold: float = 0.80
+    replay_window_seconds: float = 300.0
+    max_events_per_subject_window: int = 5
+    rapid_access_window_seconds: float = 60.0
+    max_clock_skew_seconds: float = 30.0
+    max_alerts_kept: int = 10_000
+    authorized_targeting_nodes: Set[str] = field(default_factory=lambda: {
+        "DEFENSE_COMMAND_CORE",
+        "VERIFIED_OPERATOR_CONSOLE",
+    })
+    isolated_biometric_nodes: Set[str] = field(default_factory=lambda: {
+        "HR_BIOMETRIC_DB",
+        "PERIMETER_GATE_01",
+        "COMMS_RELAY",
+    })
+
+
+class NeedleInHaystackDetector:
+    """
+    Defensive detector that acts only on severe indicators of:
+    - Cross-domain bridging of biometric data into targeting systems
+    - Biometric replay / synthetic injection
+    - Silent algorithm or target-list poisoning
+    - Coercion or safety-bypass attempts
+
+    Design rule: a single weak signal (one stressed operator, one poor
+    sensor read, one busy badge-in period) is logged as a WARNING only.
+    Containment requires either one unambiguous attack indicator or
+    two corroborating weak ones
+    """
+
+    def __init__(self, baseline_algo_state: AlgorithmState,
+                 config: Optional[DetectorConfig] = None,
+                 signing_key: Optional[bytes] = None):
+        self.config = config or DetectorConfig()
+        self._key = signing_key
+        if baseline_algo_state.signature and not signing_key:
+            raise ValueError("Baseline is signed but no signing key was provided")
+        if signing_key and not self._verify_signature(baseline_algo_state):
+            raise ValueError("Baseline signature is invalid; refusing to start")
+        self.baseline_algo = baseline_algo_state
+
+        self.seen_hashes: Dict[str, Tuple[float, Optional[str]]] = {}  # hash -> (time, seq_id)
+        self.subject_recent_events: Dict[str, Deque[float]] = {}
+        self.alerts: Deque[Tuple[AlertSeverity, str]] = deque(maxlen=self.config.max_alerts_kept)
+        self._last_prune = 0.0
+
+    # ------------------------------------------------------------------
+    # Algorithm integrity
+    # ------------------------------------------------------------------
+    def verify_algorithm_integrity(self, current_state: AlgorithmState) -> bool:
+        """Return True only if the algorithm state matches the trusted baseline."""
+        threat = False
+
+        if not hmac.compare_digest(current_state.model_weights_hash,
+                                   self.baseline_algo.model_weights_hash):
+            self._alert(AlertSeverity.CRITICAL,
+                        "APT-POISONING: Targeting algorithm weights altered")
+            threat = True
+
+        if not hmac.compare_digest(current_state.authorized_target_list_hash,
+                                   self.baseline_algo.authorized_target_list_hash):
+            self._alert(AlertSeverity.CRITICAL,
+                        "APT-FRAMING: Authorized target/threat list modified")
+            threat = True
+
+        if not current_state.human_in_the_loop_active:
+            self._alert(AlertSeverity.EMERGENCY,
+                        "SAFETY-BYPASS: Human-in-the-loop verification disabled")
+            threat = True
+
+        if self._key and not self._verify_signature(current_state):
+            self._alert(AlertSeverity.CRITICAL,
+                        "INTEGRITY: Algorithm state signature missing or invalid")
+            threat = True
+
+        if threat:
+            self._containment("algorithm_integrity")
+        return not threat
+
+    def update_baseline(self, new_state: AlgorithmState) -> bool:
+        """
+        Authorized path for legitimate model / target-list updates, so a real
+        update is not mistaken for poisoning. Requires a valid signature and
+        human-in-the-loop to remain active
+        """
+        if not self._key or not self._verify_signature(new_state):
+            self._alert(AlertSeverity.CRITICAL,
+                        "INTEGRITY: Unsigned or invalid baseline update rejected")
+            self._containment("baseline_update")
+            return False
+        if not new_state.human_in_the_loop_active:
+            self._alert(AlertSeverity.EMERGENCY,
+                        "SAFETY-BYPASS: Baseline update would disable human-in-the-loop")
+            self._containment("baseline_update")
+            return False
+        self.baseline_algo = new_state
+        self._alert(AlertSeverity.INFO, "Baseline updated through signed, authorized change")
+        return True
+
+    # ------------------------------------------------------------------
+    # Biometric events
+    # ------------------------------------------------------------------
+    def analyze_biometric_event(self, event: BiometricEvent, destination_node: str,
+                                received_at: Optional[float] = None) -> bool:
+        """
+        Returns True if the event is accepted as safe.
+        Returns False if rejected; containment fires only on severe indicators.
+        Time windows use the receiver's clock, not the sender's timestamp,
+        so a forged timestamp cannot slip past the replay window
+        """
+        now = time.time() if received_at is None else received_at
+        risk = 0
+        reasons: list[str] = []
+
+        # 0. Malformed input: reject, but do not treat as an attack by itself
+        if not (self._valid_score(event.liveness_score)
+                and self._valid_score(event.behavioral_stress_index)):
+            self._alert(AlertSeverity.WARNING,
+                        f"MALFORMED: subject {event.subject_id} — scores missing or out of range")
+            return False
+
+        # 1. Cross-domain bridging: unambiguous, contain immediately
+        if (event.source_node in self.config.isolated_biometric_nodes
+                and destination_node in self.config.authorized_targeting_nodes):
+            self._alert(AlertSeverity.CRITICAL,
+                        f"LATERAL-BRIDGE: Isolated node '{event.source_node}' "
+                        f"attempted to feed biometric data into '{destination_node}'")
+            self._containment("lateral_bridge")
+            return False
+
+        # 2. Replay / exact template reuse
+        prev = self.seen_hashes.get(event.biometric_hash)
+        if prev is not None:
+            last_seen, last_seq = prev
+            if event.sequence_id is not None and event.sequence_id == last_seq:
+                # Byte-for-byte duplicate (e.g. network retransmit): drop quietly.
+                # Not accepted, so an attacker gains nothing; no containment
+                self._alert(AlertSeverity.INFO,
+                            f"DUPLICATE: dropped repeat of sequence {event.sequence_id}")
+                return False
+            if now - last_seen < self.config.replay_window_seconds:
+                self._alert(AlertSeverity.HIGH,
+                            f"BIOMETRIC-REPLAY: Exact hash reuse for subject {event.subject_id} "
+                            f"within {self.config.replay_window_seconds:.0f}s")
+                self._containment("biometric_replay")
+                return False
+        self.seen_hashes[event.biometric_hash] = (now, event.sequence_id)
+
+        # 3. Liveness: very low is strong evidence; borderline is weak
+        if event.liveness_score < self.config.liveness_hard_floor:
+            risk += 2
+            reasons.append(f"very low liveness ({event.liveness_score:.2f})")
+        elif event.liveness_score < self.config.liveness_threshold:
+            risk += 1
+            reasons.append(f"borderline liveness ({event.liveness_score:.2f})")
+
+        # 4. Coercion: stress alone is weak (real emergencies are stressful)
+        if (event.behavioral_stress_index > self.config.stress_threshold
+                and destination_node in self.config.authorized_targeting_nodes):
+            risk += 1
+            reasons.append(f"high stress ({event.behavioral_stress_index:.2f}) on critical node")
+
+        # 5. Rapid successive access by the same subject
+        recent = self.subject_recent_events.setdefault(event.subject_id, deque())
+        recent.append(now)
+        while recent and now - recent[0] > self.config.rapid_access_window_seconds:
+            recent.popleft()
+        if len(recent) > self.config.max_events_per_subject_window:
+            risk += 1
+            reasons.append("rapid successive access")
+
+        # 6. Sender clock far in the future: possible forged / pre-built event
+        if event.timestamp - now > self.config.max_clock_skew_seconds:
+            risk += 1
+            reasons.append("timestamp in the future")
+
+        self._prune(now)
+
+        if risk >= 2:
+            self._alert(AlertSeverity.HIGH,
+                        f"ANOMALY: subject {event.subject_id} — " + "; ".join(reasons))
+            self._containment("biometric_anomaly")
+            return False
+
+        if risk == 1:
+            self._alert(AlertSeverity.WARNING,
+                        f"SUSPICIOUS: subject {event.subject_id} — " + "; ".join(reasons))
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _valid_score(x: float) -> bool:
+        return isinstance(x, (int, float)) and not math.isnan(x) and 0.0 <= x <= 1.0
+
+    def _prune(self, now: float) -> None:
+        # Run at most every 10% of the replay window instead of on every event
+        if now - self._last_prune < self.config.replay_window_seconds / 10:
+            return
+        self._last_prune = now
+        cutoff = now - self.config.replay_window_seconds * 2
+        self.seen_hashes = {h: v for h, v in self.seen_hashes.items() if v[0] > cutoff}
+        rapid_cutoff = now - self.config.rapid_access_window_seconds
+        self.subject_recent_events = {
+            s: q for s, q in self.subject_recent_events.items() if q and q[-1] > rapid_cutoff
+        }
+
+    def _verify_signature(self, state: AlgorithmState) -> bool:
+        if not self._key or not state.signature:
+            return False
+        expected = sign_state(state, self._key)
+        return hmac.compare_digest(expected, state.signature)
+
+    def _alert(self, severity: AlertSeverity, message: str) -> None:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        entry = f"[{ts} UTC] [{severity.value}] {message}"
+        self.alerts.append((severity, entry))
+        print(entry)
+
+    def _containment(self, reason: str) -> None:
+        # Placeholder: wire to the real isolation / lockout mechanism
+        print(f"   >>> [DEFENSE ACTION] Containment triggered ({reason}): "
+              "severing bridge, locking automated outputs, requiring physical re-auth.\n")
+
+
+# ---------------------------------------------------------------------------
+# Example usage
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    KEY = b"demo-key--store-the-real-one-in-an-HSM"
+
+    clean_baseline = AlgorithmState(
+        model_weights_hash=hashlib.sha256(b"VERIFIED_WEIGHTS_V4").hexdigest(),
+        authorized_target_list_hash=hashlib.sha256(b"CLEAN_ROE_LIST").hexdigest(),
+        human_in_the_loop_active=True,
+    )
+    clean_baseline.signature = sign_state(clean_baseline, KEY)
+
+    defender = NeedleInHaystackDetector(clean_baseline, signing_key=KEY)
+
+    print("--- Normal operation ---")
+    normal = BiometricEvent(
+        subject_id="OP_774",
+        biometric_hash=hashlib.sha256(b"LIVE_SCAN_VARIANCE_001").hexdigest(),
+        liveness_score=0.98,
+        source_node="PERIMETER_GATE_01",
+        timestamp=time.time(),
+        behavioral_stress_index=0.22,
+    )
+    print("Safe:", defender.analyze_biometric_event(normal, "LOCAL_ACCESS_LOG"))
+
+    print("\n--- Stressed but legitimate operator (warning only, no containment) ---")
+    stressed = BiometricEvent(
+        subject_id="OP_201",
+        biometric_hash=hashlib.sha256(b"LIVE_SCAN_VARIANCE_002").hexdigest(),
+        liveness_score=0.97,
+        source_node="OPERATOR_BADGE_READER",
+        timestamp=time.time(),
+        behavioral_stress_index=0.91,
+    )
+    print("Safe:", defender.analyze_biometric_event(stressed, "VERIFIED_OPERATOR_CONSOLE"))
+
+    print("\n--- APT lateral bridge ---")
+    apt = BiometricEvent(
+        subject_id="VIP_TARGET_09",
+        biometric_hash=hashlib.sha256(b"STOLEN_DB_TEMPLATE_XYZ").hexdigest(),
+        liveness_score=0.99,
+        source_node="HR_BIOMETRIC_DB",
+        timestamp=time.time(),
+        behavioral_stress_index=0.10,
+    )
+    defender.analyze_biometric_event(apt, "DEFENSE_COMMAND_CORE")
+
+    print("--- Replay of a captured scan ---")
+    replay = BiometricEvent(**{**normal.__dict__, "sequence_id": "attacker-new-seq"})
+    defender.analyze_biometric_event(replay, "LOCAL_ACCESS_LOG")
+
+    print("--- Algorithm poisoning (unsigned target-list change) ---")
+    poisoned = AlgorithmState(
+        model_weights_hash=clean_baseline.model_weights_hash,
+        authorized_target_list_hash=hashlib.sha256(b"MODIFIED_ROE_WITH_FRAMED_VIP").hexdigest(),
+        human_in_the_loop_active=True,
+    )
+    defender.verify_algorithm_integrity(poisoned)
+
+    print("--- Legitimate signed model update (accepted, no alarm) ---")
+    v5 = AlgorithmState(
+        model_weights_hash=hashlib.sha256(b"VERIFIED_WEIGHTS_V5").hexdigest(),
+        authorized_target_list_hash=clean_baseline.authorized_target_list_hash,
+        human_in_the_loop_active=True,
+    )
+    v5.signature = sign_state(v5, KEY)
+    defender.update_baseline(v5)
+    print("Integrity OK:", defender.verify_algorithm_integrity(v5))
