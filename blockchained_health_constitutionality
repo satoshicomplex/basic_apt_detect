@@ -1,0 +1,836 @@
+"""
+blockchained_health_constitutionality.py · BTC Complex · Rendezvous Cloak homes
+
+Finds air-quality and sanitary problems that worsen over time (including
+chronic exposure that never exceeded a daily limit). Also flags unusually
+rapid mobility decline relative to the resident’s own baseline.
+
+Privacy / anti-surveillance model (enforced):
+- Hub acts only on explicit IoT safety-check requests.
+- Max 3 s of data per request; rate-limited; only summary stats retained.
+- Strict location + sensor allowlists. Extra payload fields rejected.
+- Mobility tokens are home-salted and one-way blinded before storage.
+  Only a referral flag (no raw speed) ever leaves the hub.
+- Consent revocation purges gait history immediately.
+- New tenancy rotates salt and wipes prior stay data.
+- Signed HMAC reports + sequence numbers.
+- Right of return is preserved; relocation requires staff confirmation.
+- Resident refusal never forces eviction.
+
+Thresholds are planning defaults. Tune with building science, plumbing,
+and medical directors before production use.
+
+NOTE: Informational only. Not medical advice or diagnosis.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import math
+import os
+import statistics
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+DAY = 86_400
+MAX_WINDOW_S = 3.0
+MIN_INTERVAL_S = 300.0
+SUMMARY_RETENTION_DAYS = 365
+OUTDOOR_SEWER_WINDOW_DAYS = 7
+OUTDOOR_SEWER_PRUNE_DAYS = 30
+
+ALLOWED_LOCATIONS = frozenset({
+    "bath1", "bath2", "kitchen", "utility", "bedroom1", "bedroom2", "living",
+    "outdoor_cleanout", "outdoor_foundation",
+})
+OUTDOOR = frozenset({"outdoor_cleanout", "outdoor_foundation"})
+
+LIMITS: dict[str, tuple[float, float, str]] = {
+    "h2s_ppm":      (0.05, 0.20, "ppm"),
+    "ch4_pct_lel":  (5.0,  10.0, "%LEL"),
+    "nh3_ppm":      (2.0,  8.0,  "ppm"),
+    "humidity_pct": (55.0, 65.0, "%RH"),
+    "co2_ppm":      (1200, 2000, "ppm"),
+    "voc_index":    (250,  400,  "idx"),
+    "pm25_ugm3":    (25.0, 55.0, "µg/m³"),
+    "co_ppm":       (5.0,  9.0,  "ppm"),
+    "hcho_ppm":     (0.05, 0.08, "ppm"),
+    "radon_pcil":   (2.0,  4.0,  "pCi/L"),
+}
+ALLOWED_SENSORS = frozenset(LIMITS) | frozenset({"leak"})
+
+LONG_TERM_LIMITS = {
+    "h2s_ppm": 0.03, "nh3_ppm": 1.5, "humidity_pct": 60.0, "co2_ppm": 1100,
+    "voc_index": 200, "pm25_ugm3": 9.0, "hcho_ppm": 0.03, "radon_pcil": 4.0,
+}
+MIN_LONG_TERM_DAYS = 180
+
+ACUTE_EMERGENCY = {"co_ppm": 35.0, "ch4_pct_lel": 20.0, "h2s_ppm": 1.0}
+
+SEWER = frozenset({"h2s_ppm", "ch4_pct_lel", "nh3_ppm"})
+NEEDS_EMPTY_HOME = frozenset({"h2s_ppm", "ch4_pct_lel", "co_ppm", "leak"})
+FIX_IN_PLACE = frozenset({"radon_pcil", "humidity_pct", "co2_ppm"})
+
+# Scoring (tune with experts)
+POINTS_PROBLEM = 25
+POINTS_WATCH = 10
+POINTS_SLOPE_MAX = 20
+POINTS_DAYS_MAX = 15
+POINTS_LEAK_BASE = 15
+POINTS_LEAK_PER_DAY = 5
+POINTS_LONGTERM_BASE = 20
+POINTS_LONGTERM_MAX = 40
+LEVEL_RELOCATE = 80
+LEVEL_CLEAN = 50
+LEVEL_WATCH = 25
+
+TYPICAL_DECLINE_PER_YEAR = 0.02
+UNUSUAL_MULTIPLE = 5.0
+MIN_DECLINE = 0.10
+MIN_CHECKS = 20
+MIN_SPAN_DAYS = 60
+
+
+class Level(str, Enum):
+    OK = "OK"
+    WATCH = "WATCH"
+    CLEAN = "CLEAN"
+    RELOCATE = "RELOCATE"
+
+
+def _valid_num(x: object) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _finding(where: str, sensor: str, points: float, **extra: Any) -> dict[str, Any]:
+    base = {"where": where, "sensor": sensor, "points": round(points, 1)}
+    base.update(extra)
+    return base
+
+
+@dataclass
+class CheckSummary:
+    ts: float
+    env: dict[tuple[str, str], float]
+    leaks: set[str] = field(default_factory=set)
+    gait: dict[str, float] = field(default_factory=dict)
+
+
+class HomeSensorHub:
+    def __init__(
+        self,
+        home_id: str,
+        device_key: bytes,
+        consented_tokens: set[str] | None = None,
+        move_in_ts: float | None = None,
+        last_seq: int = 0,
+    ) -> None:
+        self.home_id = home_id
+        self._key = device_key
+        self._tenancy_salt = os.urandom(16)
+        self.consented: set[str] = set()
+        self.move_in_ts = move_in_ts
+        self.summaries: list[CheckSummary] = []
+        # Persist _seq across restarts and pass it back in as last_seq,
+        # otherwise Command rejects every report as a replay.
+        self._seq = int(last_seq)
+        self._last_ts = -1.0
+        if consented_tokens:
+            self.update_consent(consented_tokens)
+
+    def _blind_token(self, raw_token: str) -> str:
+        digest = hmac.new(self._tenancy_salt, raw_token.encode(), hashlib.sha256).hexdigest()[:12]
+        return f"res-{digest}"
+
+    def update_consent(self, consented_tokens: set[str]) -> None:
+        self.consented = {self._blind_token(t) for t in consented_tokens}
+        for s in self.summaries:
+            s.gait = {t: v for t, v in s.gait.items() if t in self.consented}
+
+    def start_new_tenancy(self, move_in_ts: float, consented_tokens: set[str] | None = None) -> None:
+        self.summaries.clear()
+        self._tenancy_salt = os.urandom(16)
+        self.move_in_ts = float(move_in_ts)
+        self.consented.clear()
+        if consented_tokens:
+            self.update_consent(consented_tokens)
+
+    def on_iot_request(self, ts: float, window: dict) -> dict:
+        if not _valid_num(ts) or ts <= self._last_ts:
+            raise ValueError("Invalid or out-of-order timestamp")
+        if self._last_ts >= 0 and (float(ts) - self._last_ts) < MIN_INTERVAL_S:
+            raise ValueError("Rate limit exceeded: continuous monitoring is prohibited")
+
+        dur = window.get("duration_s", 99)
+        if not _valid_num(dur) or dur <= 0 or float(dur) > MAX_WINDOW_S:
+            raise ValueError("Requests may read >0 and at most 3 seconds of data")
+
+        forbidden = set(window) - {"duration_s", "env", "leaks", "gait"}
+        if forbidden:
+            raise ValueError(f"Unauthorized payload fields rejected: {sorted(forbidden)}")
+        if not isinstance(window.get("env", {}), dict) or not isinstance(window.get("gait", {}), dict) \
+                or not isinstance(window.get("leaks", []), list):
+            raise ValueError("Malformed payload: env/gait must be objects, leaks a list")
+
+        self._last_ts = float(ts)
+        self._seq += 1
+
+        env: dict[tuple[str, str], float] = {}
+        for loc, sensors in window.get("env", {}).items():
+            if loc not in ALLOWED_LOCATIONS or not isinstance(sensors, dict):
+                continue
+            for key, samples in sensors.items():
+                if key not in LIMITS or not isinstance(samples, list):
+                    continue
+                clean = [float(v) for v in samples if _valid_num(v) and v >= 0]
+                if clean:
+                    env[(loc, key)] = statistics.fmean(clean)
+
+        gait: dict[str, float] = {}
+        for raw_t, speeds in window.get("gait", {}).items():
+            if not isinstance(raw_t, str):
+                continue
+            blind = self._blind_token(raw_t)
+            if blind in self.consented and isinstance(speeds, list):
+                clean = [float(x) for x in speeds if _valid_num(x) and 0.05 <= x <= 4.0]
+                if clean:
+                    gait[blind] = statistics.median(clean)
+
+        self.summaries.append(CheckSummary(
+            ts=float(ts), env=env,
+            leaks={loc for loc in window.get("leaks", []) if loc in ALLOWED_LOCATIONS},
+            gait=gait,
+        ))
+        cutoff = float(ts) - SUMMARY_RETENTION_DAYS * DAY
+        self.summaries = [s for s in self.summaries if s.ts >= cutoff]
+
+        report = self.assess()
+        if report["level"] == Level.OK.value and not report["mobility_flags"]:
+            return self._sign({
+                "home_id": self.home_id,
+                "status": "safe",
+                "ts": int(ts),
+                "seq": self._seq,
+            })
+        return self._sign(report)
+
+    def _daily(self, loc: str, key: str, days: int = 14) -> list[float]:
+        if not self.summaries:
+            return []
+        start = self.summaries[-1].ts - days * DAY
+        by_day: dict[int, list[float]] = {}
+        for s in self.summaries:
+            if s.ts >= start and (loc, key) in s.env:
+                by_day.setdefault(int(s.ts // DAY), []).append(s.env[(loc, key)])
+        return [statistics.fmean(v) for _, v in sorted(by_day.items())]
+
+    @staticmethod
+    def _slope(series: list[float]) -> float:
+        n = len(series)
+        if n < 3:
+            return 0.0
+        mx = (n - 1) / 2
+        my = statistics.fmean(series)
+        den = sum((x - mx) ** 2 for x in range(n))
+        if den == 0:
+            return 0.0
+        return sum((x - mx) * (y - my) for x, y in enumerate(series)) / den
+
+    def _acute_hazards(self) -> list[dict]:
+        if not self.summaries:
+            return []
+        latest = self.summaries[-1]
+        acute = []
+        for (loc, key), val in latest.env.items():
+            if loc in OUTDOOR or key not in ACUTE_EMERGENCY:
+                continue
+            if val >= ACUTE_EMERGENCY[key]:
+                _, _, unit = LIMITS[key]
+                acute.append(_finding(
+                    loc, key, 100.0,
+                    recent_avg=round(val, 3), unit=unit, acute_emergency=True,
+                ))
+        return acute
+
+    def _recent(self) -> tuple[float, list[dict]]:
+        if not self.summaries:
+            return 0.0, []
+        score, findings = 0.0, []
+        pairs = {p for s in self.summaries for p in s.env}
+        for loc, key in sorted(pairs):
+            watch, problem, unit = LIMITS[key]
+            daily = self._daily(loc, key)
+            if len(daily) < 3:
+                continue
+            recent = statistics.fmean(daily[-3:])
+            slope = self._slope(daily)
+            days_over = sum(d >= problem for d in daily)
+
+            pts = 0.0
+            if recent >= problem:
+                pts += POINTS_PROBLEM
+            elif recent >= watch:
+                pts += POINTS_WATCH
+            if slope > 0 and (problem - watch) > 0:
+                pts += min(POINTS_SLOPE_MAX, POINTS_SLOPE_MAX * slope * 7 / (problem - watch))
+            pts += min(POINTS_DAYS_MAX, 3 * days_over)
+
+            if pts >= POINTS_WATCH:
+                findings.append(_finding(
+                    loc, key, pts,
+                    recent_avg=round(recent, 3), unit=unit,
+                    rise_per_week=round(slope * 7, 3), days_over_limit=days_over,
+                ))
+                score += pts * (0.5 if loc in OUTDOOR else 1.0)
+
+        recent_leaks: dict[str, set[int]] = {}
+        cutoff = self.summaries[-1].ts - 14 * DAY
+        for s in self.summaries:
+            if s.ts >= cutoff:
+                for loc in s.leaks:
+                    recent_leaks.setdefault(loc, set()).add(int(s.ts // DAY))
+        for loc, days in recent_leaks.items():
+            pts = POINTS_LEAK_BASE + POINTS_LEAK_PER_DAY * min(len(days), 5)
+            findings.append(_finding(loc, "leak", pts, days_with_leak=len(days)))
+            score += pts
+        return score, findings
+
+    def _long_term(self) -> tuple[float, list[dict]]:
+        if not self.summaries:
+            return 0.0, []
+        start = self.move_in_ts if self.move_in_ts is not None else self.summaries[0].ts
+        stay = [s for s in self.summaries if s.ts >= start]
+        if not stay or (stay[-1].ts - stay[0].ts) < MIN_LONG_TERM_DAYS * DAY:
+            return 0.0, []
+        years = (stay[-1].ts - stay[0].ts) / (365 * DAY)
+        score, findings = 0.0, []
+        pairs = {
+            p for s in stay for p in s.env
+            if p[0] not in OUTDOOR and p[1] in LONG_TERM_LIMITS
+        }
+        for loc, key in sorted(pairs):
+            vals = [s.env[(loc, key)] for s in stay if (loc, key) in s.env]
+            if len(vals) < 20:
+                continue
+            avg = statistics.fmean(vals)
+            limit = LONG_TERM_LIMITS[key]
+            if avg > limit:
+                pts = min(POINTS_LONGTERM_MAX, POINTS_LONGTERM_BASE + 20 * (avg / limit - 1) + 5 * years)
+                findings.append(_finding(
+                    loc, key, pts,
+                    long_term_avg=round(avg, 3), long_term_limit=limit,
+                    years=round(years, 1), long_term=True,
+                ))
+                score += pts
+        return score, findings
+
+    def _mobility_flags(self) -> list[dict]:
+        flags = []
+        tokens = {t for s in self.summaries for t in s.gait if t in self.consented}
+        for tok in sorted(tokens):
+            pts = [(s.ts, s.gait[tok]) for s in self.summaries if tok in s.gait]
+            if len(pts) < MIN_CHECKS or (pts[-1][0] - pts[0][0]) < MIN_SPAN_DAYS * DAY:
+                continue
+            k = max(5, len(pts) // 5)
+            base = statistics.median(v for _, v in pts[:k])
+            if base <= 0:
+                continue
+            now = statistics.median(v for _, v in pts[-k:])
+            years = max((pts[-k][0] - pts[k - 1][0]) / (365 * DAY), 1e-9)
+            decline = (base - now) / base
+            if decline >= MIN_DECLINE and decline / years >= UNUSUAL_MULTIPLE * TYPICAL_DECLINE_PER_YEAR:
+                flags.append({"resident": tok, "referral_recommended": True})
+        return flags
+
+    def assess(self) -> dict:
+        acute = self._acute_hazards()
+        s1, f1 = self._recent()
+        s2, f2 = self._long_term()
+
+        if acute:
+            score = 100.0
+            level = Level.RELOCATE
+            all_findings = acute + sorted(f1 + f2, key=lambda f: -f["points"])
+        else:
+            score = min(100.0, s1 + s2)
+            if score >= LEVEL_RELOCATE:
+                level = Level.RELOCATE
+            elif score >= LEVEL_CLEAN:
+                level = Level.CLEAN
+            elif score >= LEVEL_WATCH:
+                level = Level.WATCH
+            else:
+                level = Level.OK
+            persistent = any(
+                x["where"] not in OUTDOOR and x.get("days_over_limit", 0) >= 7 for x in f1
+            )
+            if (f2 or persistent) and level in (Level.OK, Level.WATCH):
+                level = Level.CLEAN
+            all_findings = sorted(f1 + f2, key=lambda f: -f["points"])
+
+        mobility = self._mobility_flags()
+        bits = []
+        if acute:
+            bits.append("ACUTE EMERGENCY")
+        if all_findings:
+            bits.append(", ".join(f"{f['where']}:{f['sensor']}" for f in all_findings[:3]))
+        if mobility:
+            bits.append(f"{len(mobility)} mobility flag(s)")
+
+        return {
+            "home_id": self.home_id,
+            "level": level.value,
+            "env_score": round(score, 1),
+            "findings": all_findings,
+            "mobility_flags": mobility,
+            "summary": " · ".join(bits) if bits else "ok",
+            "ts": int(self.summaries[-1].ts) if self.summaries else 0,
+            "seq": self._seq,
+        }
+
+    def reset_after_renovation(self, new_move_in_ts: float | None = None) -> None:
+        self.summaries.clear()
+        self._tenancy_salt = os.urandom(16)
+        self.consented.clear()
+        self.move_in_ts = new_move_in_ts
+
+    def _sign(self, body: dict) -> dict:
+        raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        return {"report": body, "sig": hmac.new(self._key, raw, hashlib.sha256).hexdigest()}
+
+
+@dataclass
+class Home:
+    home_id: str
+    village: int
+    zone: str
+    accessible: bool = False
+    status: str = "occupied"
+    occupants: list[str] = field(default_factory=list)
+    env_score: float = 0.0
+    days_since_renovation: int = 365
+    sewer_branch: str = ""
+    return_right_reserved_for: str | None = None
+
+
+@dataclass
+class Plan:
+    home_id: str
+    recommendation: str
+    reason: str
+    options: list[str]
+    healthy_fit: str | None = None
+    needs_staff_confirmation: bool = False
+    clinic_referral: bool = False
+    resident_choice: str | None = None
+    acute_hazard: bool = False
+
+
+@dataclass
+class WorkOrder:
+    home_id: str
+    kind: str
+    detail: str
+    status: str = "open"
+
+
+RANK = {"watch": 1, "clinic_check": 2, "repair_in_place": 3, "sewer_line": 3, "relocate": 4}
+
+
+class RealTimeCommand:
+    REPEAT_LIMIT = 2
+
+    def __init__(self, homes: dict[str, Home], keys: dict[str, bytes], clinic_village: int = 4) -> None:
+        self.homes = homes
+        self._keys = keys
+        self.clinic_village = clinic_village
+        self.plans: dict[str, Plan] = {}
+        self.orders: list[WorkOrder] = []
+        self.log: list[str] = []
+        self._repeats: dict[str, int] = {}
+        self._outdoor_sewer: dict[str, float] = {}
+        self._last_seq: dict[str, int] = {}
+
+    def _validate_report_schema(self, body: dict) -> bool:
+        allowed_top = {
+            "home_id", "status", "level", "env_score", "findings",
+            "mobility_flags", "summary", "ts", "seq",
+        }
+        if not set(body).issubset(allowed_top):
+            return False
+        if body.get("status") == "safe":
+            return True
+        if body.get("level") not in {lvl.value for lvl in Level}:
+            return False
+        findings = body.get("findings")
+        if not isinstance(findings, list):
+            return False
+        for f in findings:
+            if not isinstance(f, dict):
+                return False
+            if f.get("where") not in ALLOWED_LOCATIONS or f.get("sensor") not in ALLOWED_SENSORS:
+                return False
+        flags = body.get("mobility_flags")
+        if not isinstance(flags, list):
+            return False
+        for flg in flags:
+            if not isinstance(flg, dict) or set(flg) != {"resident", "referral_recommended"}:
+                return False
+        return True
+
+    def receive(self, msg: dict) -> str:
+        if not isinstance(msg, dict):
+            return "rejected"
+        body, sig = msg.get("report"), msg.get("sig", "")
+        if not isinstance(body, dict) or not isinstance(sig, str):
+            return "rejected"
+
+        hid = body.get("home_id")
+        if not isinstance(hid, str) or hid not in self.homes:
+            self.log.append(f"REJECTED unknown home_id: {hid}")
+            return "rejected"
+
+        key = self._keys.get(hid)
+        raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        if not key or not hmac.compare_digest(hmac.new(key, raw, hashlib.sha256).hexdigest(), sig):
+            self.log.append(f"REJECTED unsigned/forged message for {hid}")
+            return "rejected"
+
+        if not self._validate_report_schema(body):
+            self.log.append(f"REJECTED schema violation / unauthorized telemetry for {hid}")
+            return "rejected"
+
+        seq = body.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq <= self._last_seq.get(hid, 0):
+            self.log.append(f"REJECTED replayed/invalid seq for {hid} (seq={seq})")
+            return "rejected"
+        self._last_seq[hid] = seq
+
+        if body.get("status") == "safe":
+            return "safe"
+
+        home = self.homes[hid]
+        home.env_score = float(body.get("env_score", 0.0))
+        if home.status != "occupied":
+            return "noted_for_crew"
+
+        plan = self._decide(home, body)
+        old = self.plans.get(hid)
+
+        # Acute gas ALWAYS alerts at once and is never swallowed by an older plan
+        if plan.acute_hazard:
+            self._order(hid, "evacuate", f"ACUTE GAS — evacuate, ventilate, call gas/fire · {plan.reason}")
+            if not (old and old.acute_hazard):
+                self.plans[hid] = plan
+                self.log.append(f"{hid}: ACUTE · {plan.reason}")
+                return "acute_evacuate"
+            return "plan_in_progress"
+
+        if old and RANK.get(plan.recommendation, 0) <= RANK.get(old.recommendation, 0):
+            return "plan_pending" if old.resident_choice in (None, "auto") else "plan_in_progress"
+
+        self.plans[hid] = plan
+        self.log.append(f"{hid}: {plan.recommendation} · {plan.reason}")
+        if plan.recommendation == "watch":
+            plan.resident_choice = "auto"
+            self._order(hid, "inspect", f"Inspection within 7 days · {plan.reason}")
+        elif plan.recommendation == "sewer_line":
+            plan.resident_choice = "auto"
+            self._order(hid, "sewer_line", plan.reason)
+        return plan.recommendation
+
+    def _prune_outdoor_sewer(self, now: float) -> None:
+        cutoff = now - OUTDOOR_SEWER_PRUNE_DAYS * DAY
+        self._outdoor_sewer = {h: t for h, t in self._outdoor_sewer.items() if t >= cutoff}
+
+    def _decide(self, home: Home, r: dict) -> Plan:
+        level = Level(r["level"])
+        findings = r.get("findings", [])
+        indoor = [x for x in findings if x["where"] not in OUTDOOR]
+        outdoor_sewer = [x for x in findings if x["where"] in OUTDOOR and x["sensor"] in SEWER]
+        where = ", ".join(
+            f"{x['where']}:{x['sensor']}" + (" (long-term)" if x.get("long_term") else "")
+            for x in findings[:4]
+        ) or "none"
+        mobility = r.get("mobility_flags", [])
+        acute = any(x.get("acute_emergency") for x in indoor)
+
+        if outdoor_sewer and not acute:
+            self._outdoor_sewer[home.home_id] = r["ts"]
+            self._prune_outdoor_sewer(r["ts"])
+            same_line = [
+                h for h, t in self._outdoor_sewer.items()
+                if h != home.home_id
+                and r["ts"] - t <= OUTDOOR_SEWER_WINDOW_DAYS * DAY
+                and home.sewer_branch
+                and self.homes[h].sewer_branch == home.sewer_branch
+            ]
+            serious_indoor = any(x["sensor"] in SEWER and x["points"] >= POINTS_PROBLEM for x in indoor)
+            if same_line and not serious_indoor and not mobility:
+                return Plan(
+                    home.home_id, "sewer_line",
+                    f"shared sewer line {home.sewer_branch} · also at {', '.join(same_line)}",
+                    options=["line crew fixes the shared sewer · no one needs to move"],
+                )
+
+        if level in (Level.CLEAN, Level.RELOCATE):
+            self._repeats[home.home_id] = self._repeats.get(home.home_id, 0) + 1
+
+        indoor_serious = {x["sensor"] for x in indoor if x["points"] >= POINTS_PROBLEM}
+        health_risk = bool(mobility) and level != Level.OK
+        needs_empty = bool(indoor_serious & NEEDS_EMPTY_HOME) or acute
+        repeat = (
+            self._repeats.get(home.home_id, 0) >= self.REPEAT_LIMIT
+            and not (indoor_serious <= FIX_IN_PLACE)
+        )
+
+        if acute or health_risk or level is Level.RELOCATE or needs_empty or repeat:
+            if acute:
+                why = "IMMEDIATE ACUTE GAS HAZARD — evacuate and ventilate"
+            elif health_risk:
+                why = "unusual mobility decline + worsening air/sanitary conditions"
+            elif needs_empty:
+                why = "indoor sewer gas, CO, or leak work needs the home empty"
+            elif repeat:
+                why = "problem keeps coming back"
+            else:
+                why = "serious conditions"
+
+            stay_ok = not (acute or health_risk or needs_empty)
+            options = ["move to Healthy Fit home (recommended)"]
+            if stay_ok:
+                options.append("stay while we repair")
+
+            return Plan(
+                home.home_id, "relocate", f"{why} · {where}",
+                options=options,
+                healthy_fit=self._healthy_fit(home, bool(mobility)),
+                needs_staff_confirmation=True,
+                clinic_referral=bool(mobility),
+                acute_hazard=acute,
+            )
+
+        if mobility:
+            return Plan(
+                home.home_id, "clinic_check",
+                "unusual mobility decline · home air OK",
+                options=["free clinic wellness visit"],
+                clinic_referral=True,
+            )
+
+        if level is Level.CLEAN:
+            return Plan(
+                home.home_id, "repair_in_place",
+                f"fixable while you stay · {where}",
+                options=["stay while we repair (recommended)", "move to a fresh home"],
+                healthy_fit=self._healthy_fit(home, False),
+            )
+
+        return Plan(home.home_id, "watch", f"early signs · {where}", options=["inspection visit"])
+
+    def _healthy_fit(self, home: Home, mobility_need: bool) -> str | None:
+        best, best_score = None, -1e9
+        for h in self.homes.values():
+            if h.status != "vacant" or h.zone != home.zone:
+                continue
+            if h.return_right_reserved_for is not None:
+                continue
+            if (mobility_need or home.accessible) and not h.accessible:
+                continue
+            if home.sewer_branch and h.sewer_branch == home.sewer_branch:
+                continue
+            s = 100 - h.env_score
+            if h.village == home.village:
+                s += 15
+            if mobility_need and h.village == self.clinic_village:
+                s += 10
+            s += max(0, 10 - h.days_since_renovation / 36)
+            if s > best_score:
+                best, best_score = h.home_id, s
+        return best
+
+    def resident_choice(self, home_id: str, choice: str, staff_confirmed: bool = False) -> str:
+        if home_id not in self.plans:
+            raise KeyError(f"No active plan for {home_id}")
+        plan = self.plans[home_id]
+        if plan.needs_staff_confirmation and not staff_confirmed:
+            raise PermissionError("Staff confirmation with resident is mandatory before executing relocation")
+
+        plan.resident_choice = choice
+        home = self.homes[home_id]
+
+        if plan.clinic_referral:
+            self._order(home_id, "clinic", "Free wellness visit at the on-site clinic (optional, non-diagnostic)")
+
+        if choice == "stay" and any(o.startswith("stay") for o in plan.options):
+            self._order(home_id, "repair", f"Repair with residents home · {plan.reason}")
+            return "repair_in_place"
+
+        if choice == "move" and plan.healthy_fit:
+            new = self.homes[plan.healthy_fit]
+            # Hold the original home for the residents now living in `new`
+            home.return_right_reserved_for = new.home_id
+            new.occupants, home.occupants = home.occupants, []
+            new.status, home.status = "occupied", "renovation"
+            self.plans.pop(home_id, None)
+            self._order(new.home_id, "move", f"Welcome residents from {home_id} · same terms · right of return preserved")
+            self._order(home_id, "renovate", f"Deep clean + renovate (held for {home_id} return) · {plan.reason}")
+            self._repeats.pop(home_id, None)
+            return f"moved_to:{new.home_id}"
+
+        if choice == "stay":
+            urgency = (
+                "IMMEDIATE safety escort + temporary daytime hospitality"
+                if plan.acute_hazard else "in-person staff + clinic safety consultation"
+            )
+            self._order(home_id, "safety_hold", f"Resident chose to stay · {urgency} · {plan.reason}")
+            return "staff_safety_consult"
+
+        self._order(home_id, "repair", "No Healthy Fit home free · urgent repair")
+        return "urgent_repair"
+
+    def finish_renovation(self, home_id: str, hub: HomeSensorHub) -> None:
+        h = self.homes[home_id]
+        h.status = "vacant"
+        h.env_score = 0.0
+        h.days_since_renovation = 0
+        self.plans.pop(home_id, None)
+        self._repeats.pop(home_id, None)
+        hub.reset_after_renovation()
+        for o in self.orders:
+            if o.home_id == home_id and o.kind == "renovate":
+                o.status = "done"
+
+    def return_home(self, home_id: str) -> str:
+        """Residents use their right of return once renovation is finished."""
+        h = self.homes[home_id]
+        temp_id = h.return_right_reserved_for
+        if temp_id is None or h.status != "vacant":
+            raise ValueError(f"{home_id} has no finished return hold")
+        temp = self.homes[temp_id]
+        h.occupants, temp.occupants = temp.occupants, []
+        h.status, temp.status = "occupied", "vacant"
+        h.return_right_reserved_for = None
+        self._order(home_id, "move", f"Residents return home from {temp_id} · moving help")
+        return f"returned_to:{home_id}"
+
+    def release_return_hold(self, home_id: str) -> None:
+        self.homes[home_id].return_right_reserved_for = None
+
+    def _order(self, home_id: str, kind: str, detail: str) -> None:
+        if not any(o.home_id == home_id and o.kind == kind and o.status == "open" for o in self.orders):
+            self.orders.append(WorkOrder(home_id, kind, detail))
+
+
+# ---------------------------------------------------------------------------
+# Example
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import random
+    random.seed(11)
+    ids = ("V4-0117", "V4-0230", "V4-0302", "V2-0410", "V2-0411", "V2-0500", "V5-0101", "V5-0102")
+    keys = {h: hashlib.sha256(f"demo-{h}".encode()).digest() for h in ids}
+    homes = {
+        "V4-0117": Home("V4-0117", 4, "seniors_disabled", True, occupants=["resident A"], sewer_branch="V4-W"),
+        "V4-0230": Home("V4-0230", 4, "seniors_disabled", True, "vacant", days_since_renovation=20, sewer_branch="V4-E"),
+        "V4-0302": Home("V4-0302", 4, "seniors_disabled", True, "vacant", env_score=30, sewer_branch="V4-W"),
+        "V2-0410": Home("V2-0410", 2, "general", occupants=["resident B", "resident C"], sewer_branch="V2-N"),
+        "V2-0411": Home("V2-0411", 2, "general", status="vacant", sewer_branch="V2-S"),
+        "V2-0500": Home("V2-0500", 2, "general", occupants=["resident D"], sewer_branch="V2-S"),
+        "V5-0101": Home("V5-0101", 5, "general", occupants=["resident E"], sewer_branch="V5-A"),
+        "V5-0102": Home("V5-0102", 5, "general", occupants=["resident F"], sewer_branch="V5-A"),
+    }
+    cmd = RealTimeCommand(homes, keys)
+    t0 = 1_800_000_000
+
+    def show(hid: str, day: int, res: str) -> None:
+        p = cmd.plans.get(hid)
+        print(f"   {hid} · day {day:3d} → {res:15s} · {p.reason if p else ''}")
+
+    print("1) Seniors home: bath 2 sewer gas creeps up over months; resident slows far faster than normal")
+    hub1 = HomeSensorHub("V4-0117", keys["V4-0117"], {"tok-A"}, move_in_ts=t0)
+    for day in range(0, 240, 2):
+        c = max(0, day - 60) / 180
+        res = cmd.receive(hub1.on_iot_request(t0 + day * DAY, {
+            "duration_s": 0.6,
+            "env": {
+                "bath2": {
+                    "h2s_ppm": [0.02 + 0.22 * c],
+                    "humidity_pct": [52 + 14 * c + random.uniform(-2, 2)],
+                },
+                "bedroom2": {"h2s_ppm": [0.01 + 0.06 * c]},
+            },
+            "gait": {"tok-A": [1.10 * (1 - 0.30 * c) + random.uniform(-0.03, 0.03)]},
+        }))
+        if res not in ("safe", "plan_pending", "plan_in_progress"):
+            show("V4-0117", day, res)
+        if res == "relocate":
+            break
+    p = cmd.plans["V4-0117"]
+    print("   options:", p.options, "| Healthy Fit:", p.healthy_fit, "| clinic:", p.clinic_referral)
+    print("   residents agree to move →", cmd.resident_choice("V4-0117", "move", staff_confirmed=True))
+
+    print("\n2) Kitchen dampness only → repair while they stay")
+    hub2 = HomeSensorHub("V2-0410", keys["V2-0410"])
+    for day in range(60):
+        res = cmd.receive(hub2.on_iot_request(t0 + day * DAY, {
+            "duration_s": 0.3,
+            "env": {"kitchen": {"humidity_pct": [56 + 0.6 * day]}},
+        }))
+        if res not in ("safe", "plan_pending", "plan_in_progress"):
+            show("V2-0410", day, res)
+        if res == "repair_in_place":
+            print("   options:", cmd.plans["V2-0410"].options)
+            print("   residents choose to stay →", cmd.resident_choice("V2-0410", "stay"))
+            break
+
+    print("\n3) Bedroom stale air: never over the daily limit, but over the long-term limit for months")
+    hub3 = HomeSensorHub("V2-0500", keys["V2-0500"], move_in_ts=t0)
+    for day in range(0, 400, 3):
+        res = cmd.receive(hub3.on_iot_request(t0 + day * DAY, {
+            "duration_s": 0.2,
+            "env": {"bedroom1": {"co2_ppm": [1150 + random.uniform(-40, 40)]}},
+        }))
+        if res not in ("safe", "plan_pending", "plan_in_progress"):
+            show("V2-0500", day, res)
+        if res == "repair_in_place":
+            print("   residents choose to stay →", cmd.resident_choice("V2-0500", "stay"))
+            break
+
+    print("\n4) Two neighbors on sewer line V5-A smell sewer gas OUTSIDE the same week")
+    hubs = {h: HomeSensorHub(h, keys[h]) for h in ("V5-0101", "V5-0102")}
+    for day in range(20):
+        for h, hub in hubs.items():
+            res = cmd.receive(hub.on_iot_request(t0 + day * DAY, {
+                "duration_s": 0.4,
+                "env": {
+                    "outdoor_cleanout": {"h2s_ppm": [0.05 + 0.03 * day]},
+                    "bath1": {"h2s_ppm": [0.01]},
+                },
+            }))
+            if res not in ("safe", "plan_pending", "plan_in_progress"):
+                show(h, day, res)
+
+    print("\nSafety checks")
+    try:
+        hub2.on_iot_request(t0 + 99 * DAY, {"duration_s": 10, "env": {}})
+    except ValueError as e:
+        print("   over-long read refused:", e)
+    print("   forged message:", cmd.receive({"report": {"home_id": "V2-0410", "status": "x"}, "sig": "0"}))
+
+    print("\n5) Renovation done → residents use their right of return")
+    cmd.finish_renovation("V4-0117", hub1)
+    print("   ", cmd.return_home("V4-0117"), "| V4-0230 now:", homes["V4-0230"].status)
+
+    print("\n6) Acute CO → evacuation order fires immediately")
+    hub6 = HomeSensorHub("V2-0410", keys["V2-0410"], last_seq=hub2._seq)  # restarted hub keeps seq
+    for d in (110, 111, 112):
+        r6 = cmd.receive(hub6.on_iot_request(t0 + d * DAY, {"duration_s": 0.5, "env": {"kitchen": {"co_ppm": [60.0]}}}))
+    print("   result:", r6, "| evacuate order:", any(o.kind == "evacuate" for o in cmd.orders))
+
+    print("\nWork orders")
+    for o in cmd.orders:
+        print(f"   {o.home_id} · {o.kind:10s} · {o.detail}")
